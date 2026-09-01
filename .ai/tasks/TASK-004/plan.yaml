@@ -1,0 +1,55 @@
+objective: "Create a root README.md that documents how the multi-agent development workflow operates for TASK-004."
+
+requirements:
+  - "Create README.md at the repository root."
+  - "Explain the Lead Agent role as the developer-facing orchestrator that manages task state, invokes workers, presents plans for approval, runs validation, routes failures, and never bypasses security or deployment controls."
+  - "Explain the Codex planning worker role as repository analysis and structured implementation-plan production only."
+  - "Explain the Claude implementation worker role as applying approved plans after approval, keeping changes scoped, running tests, and reporting deviations."
+  - "Document approval gates, including plan creation, developer approval, implementation only after PLAN_APPROVED, validation, review packaging, PR readiness, merge approval, and completion."
+  - "Document validation gates, including deterministic validation through python3 -m unittest -v and CI validation of scripts, schema, and tests."
+  - "Document that main is protected and implementation must occur on feature branches or isolated worktrees, with changes delivered through a pull request."
+  - "State that application code and workflow scripts must remain unchanged for this documentation-only task."
+
+files_to_modify: []
+
+files_to_create:
+  - path: "README.md"
+    purpose: "Root documentation for the multi-agent workflow, roles, lifecycle gates, protected-branch rules, validation, and contribution flow."
+
+acceptance_criteria:
+  - "README.md exists at the repository root."
+  - "README.md documents the Lead Agent, Codex planning worker, and Claude implementation worker responsibilities."
+  - "README.md documents approval stages from plan approval through merge approval."
+  - "README.md documents validation stages, including local validation and CI expectations."
+  - "README.md documents that main is protected and changes should go through a feature branch and pull request."
+  - "No application code is modified."
+  - "Existing workflow scripts remain unchanged, especially .ai/scripts/orchestrator.py and .ai/scripts/review-package.py."
+  - "No dependencies, production infrastructure, or CI behavior are changed."
+
+constraints:
+  - "Planning phase only: do not implement during this step."
+  - "Documentation-only change."
+  - "Do not modify application source code."
+  - "Do not modify .ai workflow scripts."
+  - "Do not modify CI configuration."
+  - "Do not introduce dependencies."
+  - "Do not modify production infrastructure."
+  - "Preserve existing repository workflow terminology from AGENTS.md, CLAUDE.md, .claude/agents/lead-agent.md, and .ai/scripts/orchestrator.py."
+
+risks:
+  - "README may drift from orchestrator behavior if it over-specifies implementation details not enforced by scripts."
+  - "Documentation could imply branch protection is fully configured remotely; local evidence only shows protected-branch checks in the orchestrator and CI targeting main and feature branches."
+  - "Review package script currently diffs app.py and test_app.py, which do not exist in the visible root; README should describe the workflow at a high level instead of relying on that script detail."
+  - "Repository contains untracked .ai/tasks/ content for TASK-004; implementation should avoid changing task-state artifacts unless explicitly performed by the orchestrator."
+
+open_questions:
+  - "Should README.md document exact orchestrator commands such as python3 .ai/scripts/orchestrator.py TASK-004 plan, approve, implement, validate, review, and complete, or keep the workflow description conceptual?"
+  - "Should README.md mention the current branch naming convention feature/TASK-004 as the recommended pattern for all tasks?"
+  - "Should README.md document failure routing states such as FAILED, REPLANNING, and DEVELOPER_CLARIFICATION_REQUIRED, or keep the first version focused on the happy path?"
+
+test_strategy:
+  - "Verify README.md exists after implementation."
+  - "Review README.md content manually against TASK-004 requirements."
+  - "Confirm git diff shows only README.md added and no modifications to application code, .ai/scripts/orchestrator.py, .ai/scripts/review-package.py, CI, schemas, or infrastructure."
+  - "Run repository validation if available: python3 -m unittest -v."
+  - "Optionally run CI-equivalent checks for unchanged workflow assets: python -B -m py_compile .ai/scripts/orchestrator.py .ai/scripts/review-package.py and python -m json.tool .ai/schemas/task-state.schema.json."
