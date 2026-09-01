@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AI Development Task State",
+  "type": "object",
+  "required": [
+    "task_id",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "pattern": "^TASK-[0-9]+$"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "NEW",
+        "ANALYZING",
+        "PLANNING",
+        "AWAITING_APPROVAL",
+        "IMPLEMENTING",
+        "VALIDATING",
+        "REPLANNING",
+        "VALIDATED",
+        "PR_READY",
+        "COMPLETED",
+        "FAILED"
+      ]
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "updated_at": {
+      "type": "string"
+    },
+    "plan_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "branch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "worktree": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "failure_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false
+}
