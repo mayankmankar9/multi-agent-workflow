@@ -4,3 +4,5 @@
 {"command": "python3 -m unittest -v", "event": "VALIDATION_STARTED", "task_id": "TASK-004", "timestamp": "2026-09-01T11:04:53.460187+05:30"}
 {"command": "python3 -m unittest -v", "event": "VALIDATION", "evidence_file": ".ai/tasks/TASK-004/test-results.json", "passed": true, "returncode": 0, "task_id": "TASK-004", "timestamp": "2026-09-01T11:05:29.885738+05:30"}
 {"branch": "feature/TASK-004", "event": "PR_READY", "plan_version": 1, "task_id": "TASK-004", "timestamp": "2026-09-01T11:05:37.622657+05:30"}
+{"approved_by": "developer", "event": "MERGE_APPROVED", "task_id": "TASK-004", "timestamp": "2026-09-01T11:25:05.072255+05:30"}
+{"branch": "feature/TASK-004", "event": "COMPLETED", "task_id": "TASK-004", "timestamp": "2026-09-01T11:25:05.072526+05:30"}
