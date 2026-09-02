@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Implementation Plan",
+  "description": "The implementation contract produced by the planning worker. Passed to codex exec via --output-schema and re-validated by the orchestrator, which never trusts the flag alone.",
+  "type": "object",
+  "required": [
+    "objective",
+    "requirements",
+    "files_to_modify",
+    "files_to_create",
+    "acceptance_criteria",
+    "constraints",
+    "risks",
+    "open_questions",
+    "test_strategy"
+  ],
+  "properties": {
+    "objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "files_to_modify": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/fileEntry"
+      }
+    },
+    "files_to_create": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/fileEntry"
+      }
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/acceptanceCriterion"
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "test_strategy": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "fileEntry": {
+      "type": "object",
+      "required": [
+        "path",
+        "purpose"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "purpose": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "acceptanceCriterion": {
+      "description": "A criterion plus how it is verified. verify is a shell command run by the validate step, or the literal \"judge\" to route the statement to a reviewer agent (not yet implemented; treated as unverified).",
+      "type": "object",
+      "required": [
+        "id",
+        "statement",
+        "verify"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^AC-[0-9]+$"
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 1
+        },
+        "verify": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Shell command that exits 0 when the criterion holds. Use the literal token {python} to invoke Python; the orchestrator expands it to the interpreter it is running on. Bare 'python' or 'python3' is an App Execution Alias stub on Windows that exits 9009 without running, so a criterion written that way fails regardless of the code."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

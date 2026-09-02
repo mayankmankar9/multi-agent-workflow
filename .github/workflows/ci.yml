@@ -13,6 +13,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    strategy:
+      # Report every version's result; do not cancel 3.12 because 3.9 failed.
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    name: test (py${{ matrix.python-version }})
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,15 +28,44 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.9"
+          python-version: ${{ matrix.python-version }}
 
       - name: Validate workflow scripts
         run: |
           python -B -m py_compile .ai/scripts/orchestrator.py
           python -B -m py_compile .ai/scripts/review-package.py
 
-      - name: Validate task-state schema
-        run: python -m json.tool .ai/schemas/task-state.schema.json
+      - name: Validate schemas
+        run: |
+          python -m json.tool .ai/schemas/task-state.schema.json
+          python -m json.tool .ai/schemas/plan.schema.json
+          python -m json.tool .ai/schemas/review-findings.schema.json
+          python -m json.tool .ai/schemas/context-block.schema.json
+
+      - name: Validate validation profile
+        run: python -m json.tool .ai/validation.json
+
+      - name: Validate hook settings
+        run: python -m json.tool .claude/settings.json
+
+      - name: Compile hooks
+        run: |
+          python -B -m py_compile .ai/hooks/session_start.py
+          python -B -m py_compile .ai/hooks/stop_guard.py
+          python -B -m py_compile .ai/hooks/pre_tool_use.py
+          python -B -m py_compile .ai/hooks/post_tool_use.py
+
+      # The launcher is shell, not Python, and it is the thing standing between
+      # a registered hook and a hook that actually runs.
+      - name: Check the hook launcher
+        run: bash -n .ai/hooks/run
+
+      - name: Preflight
+        # Reports on this runner: the worker CLIs are absent in CI, so a
+        # required check fails by design. `|| true` keeps that from failing the
+        # build while still printing the table -- CI proves the verb runs, the
+        # developer's machine is where its verdict means something.
+        run: python .ai/scripts/orchestrator.py preflight || true
 
       - name: Run tests
         run: python -m unittest -v

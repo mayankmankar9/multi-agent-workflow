@@ -1,3 +1,47 @@
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+
+# Virtual environments. `uv` creates .venv by default.
+.venv/
+venv/
+env/
+
+# Tool caches. ruff/mypy/coverage are candidate checks for
+# .ai/validation.json, so their caches are pre-ignored.
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Transient orchestrator runtime state.
+#
+# Task artifacts under .ai/tasks/ ARE tracked on purpose: they are the
+# audit trail, and TASK-004 is already committed. Do not widen these
+# patterns. Only the two genuinely transient files are ignored:
+#   .lock  - the per-task lock, released in a finally block but left behind by
+#            a crash. Committing one would make every later run refuse to start.
+#   *.tmp  - sibling temp files from the atomic state write (mkstemp + rename).
+#            Present only if a process died between write and replace.
+.ai/tasks/*/.lock
+.ai/tasks/*/*.tmp
+
+# Per-task worktrees created by `orchestrator.py TASK-XXX worktree`.
+.worktrees/
+
+# Claude Code local overrides. settings.json is shared and tracked;
+# settings.local.json is personal and must not be.
+.claude/settings.local.json
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

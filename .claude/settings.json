@@ -1,0 +1,47 @@
+{
+  "$comment": "Deterministic enforcement around a non-deterministic agent. Only exit code 2 blocks a hook - exit 1 blocks nothing, which is the most common hooks bug. The session and stop hooks no-op unless ORCHESTRATOR_TASK_ID is set, so ordinary sessions in this repo are unaffected; PreToolUse applies always, because its denials are project invariants rather than task bookkeeping. Hooks are launched through .ai/hooks/run rather than a bare `python`: on Windows `python`/`python3` are App Execution Alias stubs that exit 9009, and on most Linux images `python` is absent - either way the hook failed silently and the guard read as enforcement while enforcing nothing. The launcher executes each candidate before trusting it.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .ai/hooks/run .ai/hooks/session_start.py"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .ai/hooks/run .ai/hooks/pre_tool_use.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .ai/hooks/run .ai/hooks/post_tool_use.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .ai/hooks/run .ai/hooks/stop_guard.py"
+          }
+        ]
+      }
+    ]
+  }
+}

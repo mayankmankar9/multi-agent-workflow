@@ -1,0 +1,30 @@
+{
+  "$comment": "Ordered validation checks. Each runs independently and is recorded as its own piece of evidence, so 'tests passed but the linter failed' is expressible. JSON rather than YAML so it parses with the standard library. required=false records a result without failing the gate. {python} expands to the interpreter running the orchestrator.",
+  "checks": [
+    {
+      "name": "tests",
+      "command": "{python} -m unittest -v",
+      "required": true,
+      "expect_test_count": true,
+      "description": "Repository unit suite. An empty suite is a hard failure."
+    },
+    {
+      "name": "compile",
+      "command": "{python} -B -m py_compile .ai/scripts/orchestrator.py .ai/scripts/review-package.py",
+      "required": true,
+      "description": "Workflow scripts must byte-compile."
+    },
+    {
+      "name": "task-state-schema",
+      "command": "{python} -m json.tool .ai/schemas/task-state.schema.json",
+      "required": true,
+      "description": "Task state schema must be valid JSON."
+    },
+    {
+      "name": "plan-schema",
+      "command": "{python} -m json.tool .ai/schemas/plan.schema.json",
+      "required": true,
+      "description": "Plan schema must be valid JSON."
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reviewer Findings",
+  "description": "Structured output from one read-only reviewer subagent. Re-validated by the orchestrator: an agent's self-reported conformance is never trusted.",
+  "type": "object",
+  "required": [
+    "dimension",
+    "findings"
+  ],
+  "properties": {
+    "dimension": {
+      "type": "string",
+      "enum": [
+        "correctness",
+        "security",
+        "performance"
+      ]
+    },
+    "findings": {
+      "description": "May be empty. An empty list means the reviewer looked and found nothing, which is a different claim from not having looked.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "checked": {
+      "description": "What the reviewer actually examined. Used to report scope honestly.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "required": [
+        "severity",
+        "title",
+        "detail"
+      ],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        },
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "acceptance_criteria": {
+          "description": "Ids of acceptance criteria this finding bears on.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

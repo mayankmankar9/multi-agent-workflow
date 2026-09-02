@@ -1,0 +1,11 @@
+{
+  "task_id": "TASK-006",
+  "status": "PR_READY",
+  "created_at": "2026-09-02T11:47:49.115629+05:30",
+  "updated_at": "2026-09-02T14:00:31.059731+05:30",
+  "plan_version": 2,
+  "plan_file": ".ai\\tasks\\TASK-006\\plan-v2.json",
+  "branch": null,
+  "worktree": null,
+  "failure_reason": null
+}
