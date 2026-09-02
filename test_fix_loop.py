@@ -34,6 +34,10 @@ class FixLoopTests(TaskDirCase):
         )
         self.write_requirement()
         self.write_plan("plan.json", PLAN)
+        # `implement` captured this before the first attempt ran. `fix` refuses
+        # without it rather than capturing late, which would count the failed
+        # attempt's own output as pre-existing.
+        self.write_baseline()
         (self.task_path / "test-results.json").write_text(
             json.dumps(
                 {

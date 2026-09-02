@@ -15,10 +15,14 @@ its own input format would make the repo unusable after any harness update.
 
 Two tiers, because they answer different questions:
 
-*Evidence* -- state.json, events.jsonl, test-results.json, validation.md,
-review-findings.json -- is never writable by a worker. No plan can authorise a
-worker to write its own results; that is forging, and a plan that asked for it
-would be the clearest possible sign something had gone wrong.
+*Evidence* -- state.json, events.jsonl, baseline.json, test-results.json,
+validation.md, review-findings.json -- is never writable by a worker. No plan
+can authorise a worker to write its own results; that is forging, and a plan
+that asked for it would be the clearest possible sign something had gone wrong.
+baseline.json belongs in this tier for a specific reason: it is the record of
+what the tree looked like before the worker ran, so a worker able to edit it
+could make its own output look pre-existing, or make pre-existing files look
+like work it did.
 
 *Infrastructure* -- .ai/scripts/, .ai/schemas/, .ai/hooks/, settings.json -- is
 denied unless the approved plan declares the file. This repository's only source
@@ -45,6 +49,7 @@ ALLOW = 0
 PROTECTED_EVIDENCE_PATTERNS = (
     r"\.ai/tasks/[^/]+/state\.json$",
     r"\.ai/tasks/[^/]+/events\.jsonl$",
+    r"\.ai/tasks/[^/]+/baseline\.json$",
     r"\.ai/tasks/[^/]+/test-results\.json$",
     r"\.ai/tasks/[^/]+/validation\.md$",
     r"\.ai/tasks/[^/]+/review-findings\.json$",

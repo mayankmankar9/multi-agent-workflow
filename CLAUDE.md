@@ -62,6 +62,7 @@ to write its own verdict:
 
 - `.ai/tasks/*/state.json`
 - `.ai/tasks/*/events.jsonl`
+- `.ai/tasks/*/baseline.json`
 - `.ai/tasks/*/test-results.json`
 - `.ai/tasks/*/validation.md`
 - `.ai/tasks/*/review-findings.json`
@@ -119,6 +120,29 @@ Two parts of it are **enforced at validation time**:
 
 So declare every file you will touch, and do not treat an unverifiable
 criterion as satisfied.
+
+## A task must show it produced the change
+
+`implement` captures `baseline.json` — a hash of every file in the working tree
+— before the worker runs. It is captured **once per task**: a replan does not
+re-capture, so work done under an earlier plan version is still yours.
+Validation computes the delta against it, which is also how `files_to_modify` /
+`files_to_create` are enforced, since the implementer never commits and a
+commit-based diff sees nothing.
+
+Two consequences when you write or approve a plan:
+
+- A `files_to_create` path that already exists **fails validation**. It exists,
+  so this task cannot create it — declare it under `files_to_modify`. Likewise a
+  `files_to_modify` path left byte-identical to the baseline.
+- An acceptance criterion that passes while nothing it depends on changed is
+  recorded as `unproven`, never as passed, and fails the task. Narrow a
+  criterion with `depends_on: [path…]`; mark a deliberate regression guard with
+  `material: false`, which the developer then approves along with the plan.
+
+An artifact that was already on disk proves nothing about this task. That is not
+a technicality: it is how TASK-007 v3 reached the approval gate with two
+criteria that passed before the implementer had run.
 
 ## Validation is not a formality
 

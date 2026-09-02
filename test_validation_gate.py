@@ -161,6 +161,7 @@ class RunValidationTests(TaskDirCase):
 
     def test_empty_suite_moves_task_to_failed(self):
         self.write_state(status="VALIDATING")
+        self.write_baseline()
 
         code, out = self._validate(0, EMPTY_SUITE_STDERR)
 
@@ -180,6 +181,7 @@ class RunValidationTests(TaskDirCase):
 
     def test_real_tests_move_task_to_validated(self):
         self.write_state(status="VALIDATING")
+        self.write_baseline()
 
         code, _ = self._validate(0, THREE_PASS_STDERR)
 
@@ -194,6 +196,7 @@ class RunValidationTests(TaskDirCase):
 
     def test_validation_timeout_is_a_failure_not_a_hang(self):
         self.write_state(status="VALIDATING")
+        self.write_baseline()
 
         def fake_run(argv, **kwargs):
             raise orch.subprocess.TimeoutExpired(cmd=argv, timeout=1)

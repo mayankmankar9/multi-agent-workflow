@@ -286,6 +286,10 @@ class DiffScopeTests(unittest.TestCase):
         self.addCleanup(os.chdir, str(self._prev))
         self._git = git
 
+        # Scope is measured against the task baseline, so the tests need the
+        # same starting point a real task gets at the implement gate.
+        orch.capture_baseline(self.task_id, {"plan_version": 1})
+
     def _state(self):
         return {
             "task_id": self.task_id,
@@ -306,6 +310,12 @@ class DiffScopeTests(unittest.TestCase):
             )
         )
 
+    def _scope(self):
+        """Scope as run_validation runs it: against the task delta."""
+        delta = orch.compute_task_delta(orch.load_baseline(self.task_id))
+
+        return orch.evaluate_diff_scope(self.task_id, self._state(), delta)
+
     def _commit(self, *paths):
         for path in paths:
             full = self.tmp / path
@@ -319,7 +329,7 @@ class DiffScopeTests(unittest.TestCase):
         self._plan(create=("widget.py",))
         self._commit("widget.py")
 
-        summary = orch.evaluate_diff_scope(self.task_id, self._state())
+        summary = self._scope()
 
         self.assertEqual(summary["violations"], [])
         self.assertIn("widget.py", summary["changed"])
@@ -328,7 +338,7 @@ class DiffScopeTests(unittest.TestCase):
         self._plan(create=("widget.py",))
         self._commit("widget.py", "sneaky.py")
 
-        summary = orch.evaluate_diff_scope(self.task_id, self._state())
+        summary = self._scope()
 
         self.assertIn("sneaky.py", summary["violations"])
         self.assertNotIn("widget.py", summary["violations"])
@@ -338,7 +348,7 @@ class DiffScopeTests(unittest.TestCase):
         self._plan(create=("widget.py",))
         self._commit("widget.py")
 
-        summary = orch.evaluate_diff_scope(self.task_id, self._state())
+        summary = self._scope()
 
         self.assertEqual(
             [v for v in summary["violations"] if v.startswith(".ai/tasks/")], []
@@ -348,7 +358,7 @@ class DiffScopeTests(unittest.TestCase):
         self._plan(modify=("base.txt",), create=("widget.py",))
         self._commit("base.txt", "widget.py")
 
-        summary = orch.evaluate_diff_scope(self.task_id, self._state())
+        summary = self._scope()
 
         self.assertEqual(summary["violations"], [])
 
@@ -356,12 +366,12 @@ class DiffScopeTests(unittest.TestCase):
         self._plan(modify=("a.py",), create=("b.py",))
         self._commit("a.py")
 
-        summary = orch.evaluate_diff_scope(self.task_id, self._state())
+        summary = self._scope()
 
         self.assertEqual(summary["declared"], ["a.py", "b.py"])
 
     def test_missing_plan_is_reported_not_silently_clean(self):
-        summary = orch.evaluate_diff_scope(self.task_id, self._state())
+        summary = self._scope()
 
         self.assertIn("skipped_reason", summary)
 
@@ -399,6 +409,8 @@ class ValidationIntegrationTests(TaskDirCase):
             ),
         )
         self._profile("Ran 4 tests in 0.01s\\n\\nOK\\n")
+        self.write_baseline()
+        (self.tmp / "widget.py").write_text("w = 1\n")
 
         with quiet() as out:
             code = orch.run_validation(self.task_id)
@@ -424,6 +436,10 @@ class ValidationIntegrationTests(TaskDirCase):
             ),
         )
         self._profile("Ran 4 tests in 0.01s\\n\\nOK\\n")
+        # The baseline goes here: after the fixture has written the tree the
+        # task starts from, before the task produces anything.
+        self.write_baseline()
+        (self.tmp / "widget.py").write_text("w = 1\n")
 
         with quiet():
             code = orch.run_validation(self.task_id)
@@ -462,6 +478,8 @@ class ValidationIntegrationTests(TaskDirCase):
                 }
             )
         )
+        self.write_baseline()
+        (self.tmp / "widget.py").write_text("w = 1\n")
 
         with quiet():
             orch.run_validation(self.task_id)

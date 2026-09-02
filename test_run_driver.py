@@ -250,14 +250,23 @@ class RunDriverProgressTests(TaskDirCase):
         self.write_state(status="AWAITING_APPROVAL")
         self.write_requirement()
         self.write_plan("plan.json", PLAN_BODY)
+        self.init_git()
 
         with quiet():
             orch.approve_plan(self.task_id)
 
         passing = "\nRan 5 tests in 0.01s\n\nOK\n"
+        # git is left real: the implement gate captures a baseline from the
+        # working tree, and validation compares the tree back against it.
+        real_run = orch.subprocess.run
 
         def fake_run(argv, **kwargs):
+            if worker_name(argv) == "git":
+                return real_run(argv, **kwargs)
+
             if worker_name(argv) == "claude":
+                # A worker that does the work the plan declares.
+                (self.tmp / "widget.py").write_text("w = 1\n")
                 return mock.Mock(returncode=0, stdout="", stderr="")
 
             if "unittest" in argv:

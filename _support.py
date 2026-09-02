@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -123,6 +124,87 @@ class TaskDirCase(unittest.TestCase):
 
     def read_state(self):
         return json.loads((self.task_path / "state.json").read_text())
+
+    def init_git(self):
+        """Make the temp tree a repository.
+
+        The baseline manifest is enumerated with ``git ls-files``, so a tree
+        that is not a repo cannot produce a delta at all -- and the orchestrator
+        already requires git for branch verification and the diff base.
+        """
+        if (self.tmp / ".git").exists():
+            return
+
+        for args in (
+            ("init", "-q", "-b", "main"),
+            ("config", "user.email", "t@example.com"),
+            ("config", "user.name", "T"),
+        ):
+            subprocess.run(
+                ["git"] + list(args),
+                cwd=str(self.tmp),
+                capture_output=True,
+                check=True,
+            )
+
+    def write_baseline(self, entries=None, **overrides):
+        """A verified task baseline, as ``capture_baseline`` would leave it.
+
+        Written through the orchestrator's own digest and event so tests
+        exercise the same verification path validation does, rather than a
+        second hand-rolled notion of a valid baseline.
+
+        With no explicit ``entries`` the real working tree is hashed, so
+        whatever the fixture has already written counts as pre-existing and
+        whatever it writes afterwards counts as task-produced. Call it at the
+        point in the fixture where implementation would begin.
+        """
+        orch = load_orchestrator()
+        self.init_git()
+
+        if entries is None:
+            entries, _ = orch.tree_manifest()
+
+        payload = {
+            "task_id": self.task_id,
+            "captured_at": "2026-09-01T10:00:00+05:30",
+            "plan_version_at_capture": 1,
+            "git": {"head": None, "branch": None, "merge_base": None},
+            "manifest_algo": "sha256",
+            "truncated": False,
+            "entries": entries,
+        }
+        payload.update(overrides)
+        payload["entry_count"] = len(payload["entries"])
+        payload["baseline_sha256"] = orch.canonical_baseline_digest(payload)
+
+        path = self.task_path / "baseline.json"
+        path.write_text(json.dumps(payload, indent=2) + "\n")
+
+        with (self.task_path / "events.jsonl").open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "event": "BASELINE_CAPTURED",
+                        "baseline_sha256": payload["baseline_sha256"],
+                    }
+                )
+                + "\n"
+            )
+
+        return path, payload
+
+    def baseline_of(self, *paths):
+        """Manifest entries for files that exist in the temp tree right now."""
+        orch = load_orchestrator()
+
+        return {
+            orch.normalise_repo_path(path): {
+                "sha256": orch.digest_of_file(Path(path)),
+                "size": Path(path).stat().st_size,
+            }
+            for path in paths
+        }
 
     def write_plan(self, name="plan.json", body=None):
         path = self.task_path / name

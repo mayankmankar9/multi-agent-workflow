@@ -46,9 +46,15 @@ in a single task.
 ## Boundaries
 
 - The orchestrator owns task **evidence**. A worker never writes `state.json`,
-  `events.jsonl`, `test-results.json`, `validation.md` or `review-findings.json`
-  — no plan can authorise writing your own verdict, and the `PreToolUse` hook
-  denies it unconditionally.
+  `events.jsonl`, `baseline.json`, `test-results.json`, `validation.md` or
+  `review-findings.json` — no plan can authorise writing your own verdict, and
+  the `PreToolUse` hook denies it unconditionally.
+- A change is only yours if the **task delta** shows it. `baseline.json` records
+  the tree as it was before implementation, and validation compares the tree
+  back against it: a criterion that passes while nothing it depends on changed
+  is recorded as unproven, and a declared file that was already there is a
+  failure. So declare a file that exists under `files_to_modify`, never
+  `files_to_create`.
 - Workflow **infrastructure** — `.ai/scripts/`, `.ai/schemas/`, `.ai/hooks/`,
   `.claude/settings.json` — is writable by a worker only when the approved plan
   declares the file in `files_to_modify` or `files_to_create`. The hook checks

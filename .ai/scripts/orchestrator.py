@@ -89,6 +89,26 @@ DIFF_SCOPE_ALLOWLIST = (
     ".ai/scripts/__pycache__/",
 )
 
+# Immutable snapshot of the working tree, taken once at the implement gate.
+# Without it, validation can only see what exists now -- so a criterion whose
+# artifact was already on disk before the task started passes without the task
+# having done anything. The baseline is what makes "this task produced it" a
+# checkable claim rather than an assumption.
+BASELINE_FILENAME = "baseline.json"
+
+# Excluded from the manifest: git internals, build droppings, per-task
+# worktrees, and task evidence (orchestrator-owned, and already exempt from
+# scope enforcement via DIFF_SCOPE_ALLOWLIST).
+BASELINE_EXCLUDE_PREFIXES = (".git/", ".worktrees/", ".ai/tasks/")
+BASELINE_EXCLUDE_SEGMENTS = ("__pycache__",)
+BASELINE_EXCLUDE_SUFFIXES = (".pyc", ".pyo")
+
+# A tree bigger than this is not silently half-captured: the manifest records
+# truncated=True and validation blocks on it, because a partial baseline makes
+# the delta a guess.
+BASELINE_MAX_ENTRIES = 5000
+BASELINE_MAX_BYTES = 50 * 1024 * 1024
+
 # Top-level keys the planning prompt asks Codex for.
 PLAN_REQUIRED_KEYS = (
     "objective",
@@ -147,15 +167,14 @@ def load_state(task_id: str) -> tuple[Path, dict]:
         return path, json.load(f)
 
 
-def save_state(path: Path, state: dict) -> None:
-    """Write task state atomically.
+def write_json_atomic(path: Path, payload: dict) -> None:
+    """Write JSON via a sibling temp file and a rename.
 
-    An in-place write leaves a truncated, unparseable ``state.json`` if the
-    process dies mid-write. Writing a sibling temp file and renaming makes the
-    replacement atomic: readers see either the old state or the new one.
+    An in-place write leaves a truncated, unparseable file if the process dies
+    mid-write. The rename makes the replacement atomic: readers see either the
+    old content or the new one.
     """
-    state["updated_at"] = now()
-    payload = json.dumps(state, indent=2) + "\n"
+    body = json.dumps(payload, indent=2) + "\n"
 
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
@@ -163,7 +182,7 @@ def save_state(path: Path, state: dict) -> None:
 
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
+            f.write(body)
             f.flush()
             os.fsync(f.fileno())
 
@@ -172,6 +191,11 @@ def save_state(path: Path, state: dict) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
         raise
+
+
+def save_state(path: Path, state: dict) -> None:
+    state["updated_at"] = now()
+    write_json_atomic(path, state)
 
 
 @contextlib.contextmanager
@@ -727,6 +751,22 @@ def validate_plan(data: dict) -> List[str]:
                             f"acceptance_criteria[{index}] needs a non-empty "
                             f"string '{field}'"
                         )
+
+                if "depends_on" in entry and not _is_list_of_str(
+                    entry["depends_on"]
+                ):
+                    problems.append(
+                        f"acceptance_criteria[{index}] depends_on must be a "
+                        "list of paths"
+                    )
+
+                if "material" in entry and not isinstance(
+                    entry["material"], bool
+                ):
+                    problems.append(
+                        f"acceptance_criteria[{index}] material must be a "
+                        "boolean"
+                    )
 
                 identifier = entry.get("id")
 
@@ -1430,6 +1470,20 @@ Rules for acceptance_criteria:
   without running anything, so the criterion fails for a reason unrelated to
   the code. Write `{{python}} -m unittest module.Class`, not
   `python -m unittest module.Class`.
+- `{{python}}` is the **only** interpreter a criterion can reach. There is no
+  way to name a second one, so do not write a criterion that runs more than one
+  Python version -- no `py -3.9`, no `python3.12`, no version-specific
+  launcher. Those resolve on some machines and not others, and a criterion that
+  fails for a missing interpreter is recorded as a failed criterion, which
+  reads as "the change is wrong" when nothing about the change was tested.
+  **Multi-version coverage belongs to the CI matrix, not to an acceptance
+  criterion.** If a requirement asks for several versions, say so in
+  `constraints` and let CI own it.
+- Prefer a named test selector over bare discovery. `{{python}} -m unittest
+  discover` exits 0 on a suite that discovers nothing ("Ran 0 tests ... OK"),
+  so a criterion written that way passes when the tests it names do not exist.
+  `{{python}} -m unittest module.Class` fails if the class is missing, which is
+  what you want.
 - Prefer deterministic checks: `test -f path`, `git diff --quiet -- path`,
   a specific test selector.
 - Use the literal "judge" only where no command can express the criterion. It
@@ -1679,13 +1733,22 @@ def critique_plan(task_id: str, plan_file: Path, state: dict) -> Tuple[bool, dic
     an unavailable checker must not become a gate nobody can pass.
     """
     directory = task_dir(task_id)
+    notes = plan_starting_state_problems(plan_file)
+    starting_state = ""
+
+    if notes:
+        starting_state = (
+            "\nThe orchestrator already checked the plan against the current "
+            "tree and found:\n"
+            + "".join("- %s\n" % note for note in notes)
+        )
 
     prompt = f"""Critique the implementation plan for {task_id} against its requirement.
 
 Read:
 - {directory / "requirement.md"}
 - {plan_file}
-
+{starting_state}
 Check for:
 - Coverage: does every requirement map to something in the plan?
 - Consistency: do the acceptance criteria contradict each other or the
@@ -1756,6 +1819,66 @@ def critic_feedback(detail: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def critique_round(
+    task_id: str, plan_file: Path, state: dict, attempt: int
+) -> Tuple[bool, bool, dict]:
+    """Run the critic on one candidate plan and record what it said.
+
+    Returns ``(acceptable, ran, detail)``.
+
+    Shared by planning and replanning because it used to live only in
+    ``run_plan``: a replanned plan reached the human gate with no critique at
+    all, and a plan written in response to a failure is the one most worth
+    criticising. TASK-007 demonstrated the cost -- v1 drew six critic issues,
+    v2 was produced by a replan, drew none, and reached the gate with an
+    acceptance criterion naming a test class that existed nowhere in the plan
+    or the tree.
+
+    A critic that could not run is reported as not having run and treated as
+    acceptable. An unavailable checker must not become a gate nobody can pass,
+    and "did not run" is recorded as itself rather than as approval.
+    """
+    notes = plan_starting_state_problems(plan_file)
+
+    if notes:
+        print("Plan vs. current tree:")
+
+        for note in notes:
+            print(f"  {note}")
+
+        record_event(
+            task_id, "PLAN_STARTING_STATE_MISMATCH", notes=notes, round=attempt
+        )
+
+    acceptable, detail = critique_plan(task_id, plan_file, state)
+
+    if not detail.get("ran"):
+        print(f"Plan critic did not run: {detail.get('error')}")
+        record_event(
+            task_id, "PLAN_CRITIQUED", ran=False, note=detail.get("error")
+        )
+        return True, False, detail
+
+    record_event(
+        task_id,
+        "PLAN_CRITIQUED",
+        ran=True,
+        round=attempt,
+        verdict=detail.get("verdict"),
+        issues=len(detail.get("issues", [])),
+        blocking=len(detail.get("blocking", [])),
+    )
+
+    for issue in detail.get("issues", []):
+        if isinstance(issue, dict):
+            print(
+                "  [%s] %s"
+                % (issue.get("severity", "?"), issue.get("issue", ""))
+            )
+
+    return acceptable, True, detail
+
+
 def run_plan(task_id: str) -> int:
     state_path, state = load_state(task_id)
 
@@ -1776,31 +1899,12 @@ def run_plan(task_id: str) -> int:
 
     for attempt in range(1, CRITIC_MAX_ROUNDS + 1):
         plan_file = run_codex_planning(task_id, extra=extra)
-        acceptable, detail = critique_plan(task_id, plan_file, state)
-
-        if not detail.get("ran"):
-            print(f"Plan critic did not run: {detail.get('error')}")
-            record_event(
-                task_id, "PLAN_CRITIQUED", ran=False, note=detail.get("error")
-            )
-            break
-
-        record_event(
-            task_id,
-            "PLAN_CRITIQUED",
-            ran=True,
-            round=attempt,
-            verdict=detail.get("verdict"),
-            issues=len(detail.get("issues", [])),
-            blocking=len(detail.get("blocking", [])),
+        acceptable, ran, detail = critique_round(
+            task_id, plan_file, state, attempt
         )
 
-        for issue in detail.get("issues", []):
-            if isinstance(issue, dict):
-                print(
-                    "  [%s] %s"
-                    % (issue.get("severity", "?"), issue.get("issue", ""))
-                )
+        if not ran:
+            break
 
         if acceptable:
             print(f"Plan critic: pass (round {attempt}).")
@@ -1879,6 +1983,10 @@ def approve_plan(task_id: str) -> int:
         f"Plan v{plan_version} approved for {task_id} "
         f"(sha256 {digest[:12]})."
     )
+
+    for note in plan_starting_state_problems(plan_file):
+        print(f"WARNING: {note}")
+
     return 0
 
 
@@ -2056,8 +2164,34 @@ def run_implementation(task_id: str) -> int:
     if verify_approval(task_id, state, plan_file) != 0:
         return 1
 
+    # Before the worker touches anything. Write-once, so a replanned task
+    # re-entering this gate keeps the baseline it started from.
+    try:
+        baseline = capture_baseline(task_id, state)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        print(f"ERROR: could not capture the task baseline: {exc}")
+        record_event(
+            task_id,
+            "IMPLEMENTATION_FAILED",
+            worker="orchestrator",
+            stage="baseline_capture",
+            failure_reason=str(exc)[:500],
+        )
+        return 1
+
+    state["baseline_file"] = str(baseline_file(task_id))
+    state["baseline_sha256"] = baseline["baseline_sha256"]
     state["status"] = "IMPLEMENTING"
     save_state(state_path, state)
+
+    print(
+        "Task baseline: %d files, sha256 %s (captured at plan v%s)."
+        % (
+            baseline["entry_count"],
+            baseline["baseline_sha256"][:12],
+            baseline["plan_version_at_capture"],
+        )
+    )
 
     record_event(
         task_id,
@@ -2331,6 +2465,15 @@ def run_fix(task_id: str) -> int:
     if verify_approval(task_id, state, plan_file) != 0:
         return 1
 
+    # A fix follows an implementation, which captured the baseline. Refusing
+    # here rather than capturing late is deliberate: a baseline taken after the
+    # first attempt would count that attempt's own output as pre-existing.
+    try:
+        load_baseline(task_id)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
     record_event(
         task_id,
         "IMPLEMENTATION_STARTED",
@@ -2362,7 +2505,329 @@ def run_fix(task_id: str) -> int:
     return enter_validating(task_id, state_path, state)
 
 
-def evaluate_acceptance_criteria(task_id: str, state: dict) -> dict:
+def normalise_repo_path(path: str) -> str:
+    """Canonical repo-relative form: forward slashes, no ``./`` prefix.
+
+    ``state.json`` carries Windows separators and git reports POSIX ones, so a
+    manifest path and the same path as declared in a plan would otherwise never
+    compare equal.
+    """
+    candidate = (path or "").replace("\\", "/")
+
+    while candidate.startswith("./"):
+        candidate = candidate[2:]
+
+    return candidate
+
+
+def baseline_file(task_id: str) -> Path:
+    return task_dir(task_id) / BASELINE_FILENAME
+
+
+def baseline_excluded(path: str) -> bool:
+    if any(path.startswith(prefix) for prefix in BASELINE_EXCLUDE_PREFIXES):
+        return True
+
+    if any(path.endswith(suffix) for suffix in BASELINE_EXCLUDE_SUFFIXES):
+        return True
+
+    return any(part in BASELINE_EXCLUDE_SEGMENTS for part in path.split("/"))
+
+
+def enumerate_tree() -> List[str]:
+    """Every file git considers part of the working tree.
+
+    ``--cached --others --exclude-standard`` is tracked files plus untracked
+    ones ``.gitignore`` does not cover -- exactly the set a worker can change.
+    One subprocess, and ``.gitignore`` is honoured for free.
+    """
+    result = subprocess.run(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=GIT_TIMEOUT_S,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "git ls-files failed: %s" % (result.stderr or "").strip()
+        )
+
+    paths = set()
+
+    for raw in result.stdout.split("\0"):
+        path = normalise_repo_path(raw.strip())
+
+        if not path or baseline_excluded(path):
+            continue
+
+        paths.add(path)
+
+    return sorted(paths)
+
+
+def digest_of_file(path: Path) -> str:
+    digest = hashlib.sha256()
+
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def tree_manifest() -> Tuple[dict, bool]:
+    """Hash the working tree. Returns ``(entries, truncated)``.
+
+    Raw working-tree bytes, not git blob ids. Both sides of every comparison
+    are working-tree reads, so ``core.autocrlf`` -- active in this repo --
+    cancels out. Blob ids would not: git normalises line endings on the way
+    into the index, so a CRLF-only change would hash identical.
+    """
+    entries: dict = {}
+    total = 0
+    truncated = False
+
+    for path in enumerate_tree():
+        if len(entries) >= BASELINE_MAX_ENTRIES or total > BASELINE_MAX_BYTES:
+            truncated = True
+            break
+
+        full = Path(path)
+
+        # --cached lists index entries, including files deleted from the tree.
+        if not full.is_file():
+            continue
+
+        try:
+            size = full.stat().st_size
+            entries[path] = {"sha256": digest_of_file(full), "size": size}
+            total += size
+        except OSError as exc:
+            # Recorded as unreadable rather than dropped. Dropping it would
+            # make the file invisible to the delta, which is the failure mode
+            # this whole mechanism exists to close.
+            entries[path] = {
+                "sha256": None,
+                "size": None,
+                "unreadable": str(exc)[:200],
+            }
+
+    return entries, truncated
+
+
+def canonical_baseline_digest(payload: dict) -> str:
+    """Hash a baseline's content, excluding the hash field itself."""
+    body = {key: value for key, value in payload.items()
+            if key != "baseline_sha256"}
+
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def git_head() -> Optional[str]:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=GIT_TIMEOUT_S,
+    )
+
+    if result.returncode != 0:
+        return None
+
+    return result.stdout.strip() or None
+
+
+def capture_baseline(task_id: str, state: dict) -> dict:
+    """Snapshot the working tree before implementation. Write-once.
+
+    Keyed to the task, never to the plan version. A replan must not re-capture:
+    work the task already did under an earlier plan version would be relabelled
+    as pre-existing, which is exactly the false pass this closes. So an
+    existing baseline is returned as-is (verified), not rewritten.
+    """
+    path = baseline_file(task_id)
+
+    if path.is_file():
+        return load_baseline(task_id)
+
+    entries, truncated = tree_manifest()
+
+    payload = {
+        "task_id": task_id,
+        "captured_at": now(),
+        "plan_version_at_capture": state.get("plan_version", 1),
+        "git": {
+            "head": git_head(),
+            "branch": current_branch() or None,
+            "merge_base": resolve_diff_base(),
+        },
+        "manifest_algo": "sha256",
+        "entry_count": len(entries),
+        "truncated": truncated,
+        "entries": entries,
+    }
+    payload["baseline_sha256"] = canonical_baseline_digest(payload)
+
+    write_json_atomic(path, payload)
+
+    record_event(
+        task_id,
+        "BASELINE_CAPTURED",
+        baseline_file=str(path),
+        baseline_sha256=payload["baseline_sha256"],
+        entry_count=payload["entry_count"],
+        truncated=truncated,
+        head=payload["git"]["head"],
+        plan_version=payload["plan_version_at_capture"],
+    )
+    return payload
+
+
+def load_baseline(task_id: str) -> dict:
+    """The task's baseline, verified. Raises if it cannot be trusted.
+
+    Two hashes must agree: the file's own ``baseline_sha256`` (self
+    consistency) and the digest recorded in the append-only
+    ``BASELINE_CAPTURED`` event (tamper detection). Same binding approval uses
+    -- evidence that can be edited after the fact is not evidence.
+    """
+    path = baseline_file(task_id)
+
+    if not path.is_file():
+        raise RuntimeError(
+            "no task baseline at %s, so the task delta cannot be established. "
+            "A baseline is captured at the implement gate; a task validated "
+            "without one cannot show it produced anything." % path
+        )
+
+    try:
+        with path.open(encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("task baseline is unreadable: %s" % exc)
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("task baseline is not a JSON object")
+
+    recorded = payload.get("baseline_sha256")
+    actual = canonical_baseline_digest(payload)
+
+    if recorded != actual:
+        raise RuntimeError(
+            "task baseline has been modified since capture (records %s, "
+            "recomputes to %s)" % (recorded, actual)
+        )
+
+    captures = [
+        event
+        for event in iter_events(task_id)
+        if event.get("event") == "BASELINE_CAPTURED"
+    ]
+
+    if not captures:
+        raise RuntimeError(
+            "task baseline exists but no BASELINE_CAPTURED event records it, "
+            "so it cannot be verified"
+        )
+
+    expected = captures[-1].get("baseline_sha256")
+
+    if expected != actual:
+        raise RuntimeError(
+            "task baseline does not match the digest recorded at capture "
+            "(event %s, file %s)" % (expected, actual)
+        )
+
+    return payload
+
+
+def compute_task_delta(baseline: dict) -> dict:
+    """What changed in the working tree since the baseline was captured.
+
+    Content-based, so it sees uncommitted work. That matters because the
+    implementer never commits: a commit-based comparison reports an empty
+    change set for every task this workflow has ever run.
+    """
+    entries, truncated = tree_manifest()
+    base = baseline.get("entries") or {}
+
+    created = sorted(path for path in entries if path not in base)
+    modified = sorted(
+        path
+        for path in entries
+        if path in base
+        and entries[path].get("sha256") != base[path].get("sha256")
+    )
+    deleted = sorted(path for path in base if path not in entries)
+
+    return {
+        "baseline_sha256": baseline.get("baseline_sha256"),
+        "baseline_captured_at": baseline.get("captured_at"),
+        "plan_version_at_capture": baseline.get("plan_version_at_capture"),
+        "created": created,
+        "modified": modified,
+        "deleted": deleted,
+        "produced": sorted(set(created) | set(modified) | set(deleted)),
+        "unchanged_count": len(entries) - len(created) - len(modified),
+        "baseline_truncated": bool(baseline.get("truncated")),
+        "truncated": truncated,
+    }
+
+
+def plan_starting_state_notes(plan: dict) -> List[str]:
+    """Where a plan disagrees with the tree it will be applied to.
+
+    A ``files_to_create`` entry naming a path that already exists is the defect
+    behind TASK-007: the criteria verifying that artifact pass before the
+    implementer runs, so the plan can be satisfied by doing nothing. It is
+    deterministic, so it belongs at the gate rather than in a critic's
+    judgement.
+    """
+    notes = []
+
+    if not isinstance(plan, dict):
+        return notes
+
+    for path in plan_file_paths(plan, "files_to_create"):
+        if Path(normalise_repo_path(path)).exists():
+            notes.append(
+                "files_to_create declares %s, which already exists. Declare it "
+                "in files_to_modify instead: validation requires a created "
+                "file to be absent at the task baseline." % path
+            )
+
+    for path in plan_file_paths(plan, "files_to_modify"):
+        if not Path(normalise_repo_path(path)).exists():
+            notes.append(
+                "files_to_modify declares %s, which does not exist. Declare it "
+                "in files_to_create instead." % path
+            )
+
+    return notes
+
+
+def plan_starting_state_problems(plan_file: Path) -> List[str]:
+    """``plan_starting_state_notes`` for a plan on disk, tolerant of a bad one.
+
+    An unparseable or missing plan is reported by the plan validator, not here;
+    this must not turn into a second, noisier error path.
+    """
+    try:
+        return plan_starting_state_notes(load_plan(plan_file))
+    except (RuntimeError, OSError):
+        return []
+
+
+def evaluate_acceptance_criteria(
+    task_id: str, state: dict, delta: Optional[dict] = None
+) -> dict:
     """Execute each acceptance criterion's ``verify`` command.
 
     ``plan.json`` has always carried a well-formed ``acceptance_criteria`` list
@@ -2373,6 +2838,14 @@ def evaluate_acceptance_criteria(task_id: str, state: dict) -> dict:
     ``verify: "judge"`` is recorded as unverified rather than passed -- routing
     it to a reviewer agent is Phase 2. An unverified criterion never counts as
     satisfied.
+
+    A command exiting 0 says the criterion holds *now*, not that this task made
+    it hold. So each criterion is also given a provenance against the task
+    delta: one that passes while every file it depends on is unchanged since
+    the baseline is recorded as ``pre_existing`` and counted ``unproven`` --
+    never as passed. A criterion that is deliberately a regression guard says
+    so in the plan with ``material: false``, which goes through the developer's
+    hash-bound approval like everything else in the contract.
     """
     plan_file = resolve_plan_file(task_id, state)
     summary = {
@@ -2380,6 +2853,7 @@ def evaluate_acceptance_criteria(task_id: str, state: dict) -> dict:
         "passed": 0,
         "failed": 0,
         "unverified": 0,
+        "unproven": 0,
         "results": [],
     }
 
@@ -2398,10 +2872,24 @@ def evaluate_acceptance_criteria(task_id: str, state: dict) -> dict:
     criteria = plan.get("acceptance_criteria") or []
     summary["total"] = len(criteria)
 
+    declared_all = sorted(
+        {
+            normalise_repo_path(path)
+            for key in ("files_to_modify", "files_to_create")
+            for path in plan_file_paths(plan, key)
+        }
+    )
+    produced = set(delta["produced"]) if delta is not None else None
+
     for entry in criteria:
         identifier = entry.get("id", "?")
         statement = entry.get("statement", "")
         verify = (entry.get("verify") or "").strip()
+        depends_on = [
+            normalise_repo_path(path) for path in (entry.get("depends_on") or [])
+        ]
+        evidence_paths = depends_on or declared_all
+        declared_material = entry.get("material", True) is not False
 
         if verify == "judge":
             summary["unverified"] += 1
@@ -2411,6 +2899,10 @@ def evaluate_acceptance_criteria(task_id: str, state: dict) -> dict:
                     "statement": statement,
                     "verify": verify,
                     "passed": None,
+                    "proven": False,
+                    "provenance": "unverified",
+                    "material": declared_material,
+                    "evidence_paths": evidence_paths,
                     "returncode": None,
                     "output": "",
                     "note": "requires a reviewer agent; not verified",
@@ -2441,21 +2933,48 @@ def evaluate_acceptance_criteria(task_id: str, state: dict) -> dict:
 
         ok = returncode == 0
 
-        if ok:
+        if not declared_material:
+            provenance = "regression_guard"
+        elif produced is None or not evidence_paths:
+            # No delta, or a plan that declares no files: provenance is
+            # genuinely unknown, and "unknown" is recorded as itself rather
+            # than resolved in either direction.
+            provenance = "unknown"
+        elif any(path in produced for path in evidence_paths):
+            provenance = "task_produced"
+        else:
+            provenance = "pre_existing"
+
+        proven = not (ok and provenance == "pre_existing")
+
+        if not ok:
+            summary["failed"] += 1
+        elif proven:
             summary["passed"] += 1
         else:
-            summary["failed"] += 1
+            summary["unproven"] += 1
 
-        summary["results"].append(
-            {
-                "id": identifier,
-                "statement": statement,
-                "verify": verify,
-                "passed": ok,
-                "returncode": returncode,
-                "output": output[-2000:],
-            }
-        )
+        result = {
+            "id": identifier,
+            "statement": statement,
+            "verify": verify,
+            "passed": ok,
+            "proven": proven,
+            "provenance": provenance,
+            "material": declared_material,
+            "evidence_paths": evidence_paths,
+            "returncode": returncode,
+            "output": output[-2000:],
+        }
+
+        if ok and not proven:
+            result["note"] = (
+                "the command passed, but nothing it depends on changed since "
+                "the task baseline: this criterion was already satisfied "
+                "before the task ran"
+            )
+
+        summary["results"].append(result)
 
     return summary
 
@@ -2493,15 +3012,31 @@ def resolve_diff_base() -> Optional[str]:
     return None
 
 
-def evaluate_diff_scope(task_id: str, state: dict) -> dict:
-    """Compare the actual diff against the files the plan declared.
+def evaluate_diff_scope(
+    task_id: str, state: dict, delta: Optional[dict] = None
+) -> dict:
+    """Compare what the task produced against what the plan declared.
 
-    ``changed ⊆ files_to_modify ∪ files_to_create ∪ allowlist``. This is the
-    cheap deterministic check that catches the failure mode that actually
-    matters with coding agents: quiet blast-radius creep.
+    Two questions, both answered from the task delta:
+
+    - ``produced ⊆ files_to_modify ∪ files_to_create ∪ allowlist`` -- the cheap
+      deterministic check for quiet blast-radius creep.
+    - every declared file was actually produced -- the check that stops a
+      criterion being satisfied by an artifact that was already on disk.
+
+    The source of truth used to be ``git diff {base}...HEAD``, which compares
+    commits. The implementer never commits, so that set was empty on every task
+    this workflow has run: TASK-006's evidence records five declared files and
+    ``"changed": []``, and the check passed. The committed set is still
+    recorded, as corroboration rather than as the measurement.
     """
     plan_file = resolve_plan_file(task_id, state)
-    summary = {"declared": [], "changed": [], "violations": []}
+    summary = {
+        "declared": [],
+        "changed": [],
+        "violations": [],
+        "unproduced": [],
+    }
 
     if not plan_file.is_file():
         summary["skipped_reason"] = f"plan file not found: {plan_file}"
@@ -2513,30 +3048,91 @@ def evaluate_diff_scope(task_id: str, state: dict) -> dict:
         summary["skipped_reason"] = str(exc)
         return summary
 
-    declared = set(plan_file_paths(plan, "files_to_modify")) | set(
-        plan_file_paths(plan, "files_to_create")
-    )
+    declared_modify = {
+        normalise_repo_path(path)
+        for path in plan_file_paths(plan, "files_to_modify")
+    }
+    declared_create = {
+        normalise_repo_path(path)
+        for path in plan_file_paths(plan, "files_to_create")
+    }
+    declared = declared_modify | declared_create
     summary["declared"] = sorted(declared)
 
-    base = resolve_diff_base()
-
-    if base is None:
+    if delta is None:
         summary["skipped_reason"] = (
-            "no diff base resolved (tried %s)" % ", ".join(BASE_REF_CANDIDATES)
+            "no task delta available; scope cannot be established without a "
+            "verified baseline"
         )
         return summary
 
-    summary["base"] = base
-    changed = changed_files_against_base(base)
+    changed = list(delta["produced"])
+    created = set(delta["created"])
+    changed_set = set(changed)
     summary["changed"] = changed
+    summary["created"] = delta["created"]
+    summary["modified"] = delta["modified"]
+    summary["deleted"] = delta["deleted"]
 
-    violations = [
+    base = resolve_diff_base()
+
+    if base is not None:
+        summary["base"] = base
+        committed = changed_files_against_base(base)
+        summary["committed_changed"] = committed
+        # A committed change absent from the delta means history moved or the
+        # change was reverted. Recorded rather than assumed away.
+        summary["committed_not_in_delta"] = sorted(
+            set(committed) - changed_set
+        )
+
+    summary["violations"] = [
         path
         for path in changed
         if path not in declared
         and not any(path.startswith(prefix) for prefix in DIFF_SCOPE_ALLOWLIST)
     ]
-    summary["violations"] = violations
+
+    unproduced = []
+
+    for path in sorted(declared_create):
+        if path in created:
+            continue
+
+        if Path(path).is_file():
+            reason = (
+                "declared as created but already existed at the task baseline"
+            )
+        else:
+            reason = "declared as created but does not exist"
+
+        unproduced.append(
+            {"path": path, "declared_as": "create", "reason": reason}
+        )
+
+    changed_in_place = set(delta["modified"]) | set(delta["deleted"])
+
+    for path in sorted(declared_modify):
+        if path in changed_in_place:
+            continue
+
+        if path in created:
+            reason = (
+                "declared as modified but did not exist at the task baseline"
+            )
+        elif Path(path).is_file():
+            reason = (
+                "declared as modified but is byte-identical to the task "
+                "baseline"
+            )
+        else:
+            reason = "declared as modified but does not exist"
+
+        unproduced.append(
+            {"path": path, "declared_as": "modify", "reason": reason}
+        )
+
+    summary["unproduced"] = unproduced
     return summary
 
 
@@ -2578,8 +3174,53 @@ def run_validation(task_id: str) -> int:
 
     blocking = [c for c in checks if c["required"] and not c["passed"]]
 
-    criteria = evaluate_acceptance_criteria(task_id, state)
-    scope = evaluate_diff_scope(task_id, state)
+    # The delta is established before anything is judged: every provenance
+    # claim below depends on it, and a task with no verifiable baseline must
+    # fail closed rather than fall back to "whatever is on disk now".
+    baseline_error = None
+    delta = None
+
+    try:
+        delta = compute_task_delta(load_baseline(task_id))
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        baseline_error = str(exc)
+
+    criteria = evaluate_acceptance_criteria(task_id, state, delta)
+    scope = evaluate_diff_scope(task_id, state, delta)
+
+    if baseline_error is not None:
+        blocking.append(
+            {"name": "task-baseline", "failure_reason": baseline_error}
+        )
+    elif delta["truncated"] or delta["baseline_truncated"]:
+        blocking.append(
+            {
+                "name": "task-baseline",
+                "failure_reason": "the working-tree manifest was truncated, "
+                "so the task delta is incomplete",
+            }
+        )
+
+    if criteria.get("unproven"):
+        blocking.append(
+            {
+                "name": "acceptance-criteria-provenance",
+                "failure_reason": "%d of %d acceptance criteria passed "
+                "against artifacts unchanged since the task baseline"
+                % (criteria["unproven"], criteria["total"]),
+            }
+        )
+
+    if scope.get("unproduced"):
+        blocking.append(
+            {
+                "name": "declared-not-produced",
+                "failure_reason": "; ".join(
+                    "%s: %s" % (item["path"], item["reason"])
+                    for item in scope["unproduced"][:5]
+                ),
+            }
+        )
 
     if criteria.get("failed"):
         blocking.append(
@@ -2617,6 +3258,8 @@ def run_validation(task_id: str) -> int:
         "checks": checks,
         "acceptance_criteria": criteria,
         "diff_scope": scope,
+        "task_delta": delta,
+        "task_baseline_error": baseline_error,
         # Legacy top-level fields, from the primary check.
         "command": primary["command"],
         "returncode": primary["returncode"],
@@ -2639,20 +3282,58 @@ def run_validation(task_id: str) -> int:
         command=primary["command"],
         checks={c["name"]: c["passed"] for c in checks},
         acceptance_criteria_failed=criteria.get("failed"),
+        acceptance_criteria_unproven=criteria.get("unproven"),
         diff_scope_violations=len(scope.get("violations") or []),
+        declared_not_produced=len(scope.get("unproduced") or []),
+        baseline_sha256=(delta or {}).get("baseline_sha256"),
+        task_delta_counts=None
+        if delta is None
+        else {
+            "created": len(delta["created"]),
+            "modified": len(delta["modified"]),
+            "deleted": len(delta["deleted"]),
+        },
         evidence_file=str(results_file),
     )
+
+    if baseline_error is not None:
+        print(f"Task baseline: UNAVAILABLE ({baseline_error})")
+    elif delta is not None:
+        print(
+            "Task delta since baseline (%s, plan v%s): "
+            "%d created, %d modified, %d deleted."
+            % (
+                (delta["baseline_sha256"] or "?")[:12],
+                delta["plan_version_at_capture"],
+                len(delta["created"]),
+                len(delta["modified"]),
+                len(delta["deleted"]),
+            )
+        )
 
     if criteria.get("results"):
         print("Acceptance criteria:")
 
         for item in criteria["results"]:
-            mark = {
-                True: "PASS",
-                False: "FAIL",
-                None: "UNVERIFIED",
-            }[item["passed"]]
+            if item["passed"] is None:
+                mark = "UNVERIFIED"
+            elif not item["passed"]:
+                mark = "FAIL"
+            elif not item.get("proven", True):
+                mark = "UNPROVEN"
+            else:
+                mark = "PASS"
+
             print(f"  {mark} {item['id']}: {item['statement']}")
+
+            if mark == "UNPROVEN":
+                print(f"    {item['note']}")
+
+    if scope.get("unproduced"):
+        print("Declared but not produced by this task:")
+
+        for item in scope["unproduced"]:
+            print(f"  {item['path']}: {item['reason']}")
 
     if scope.get("violations"):
         print("Scope violations (changed but not declared in the plan):")
@@ -2926,6 +3607,7 @@ def run_codex_replan(
     plan_version: int,
     previous_plan: Optional[Path] = None,
     state: Optional[dict] = None,
+    extra_feedback: str = "",
 ) -> Optional[Path]:
     """Produce a revised plan. Returns the new plan file, or None on failure.
 
@@ -2943,8 +3625,11 @@ def run_codex_replan(
 
     plan_file = directory / f"plan-v{plan_version}.json"
 
-    extra = shared_context(task_id) + clarification_context(task_id) + replan_context(
-        task_id, state or {}, previous_plan
+    extra = (
+        shared_context(task_id)
+        + clarification_context(task_id)
+        + replan_context(task_id, state or {}, previous_plan)
+        + (extra_feedback or "")
     )
 
     prompt = plan_prompt(
@@ -3139,6 +3824,75 @@ def classify_failure_with_agent(
     }
 
 
+def reject_plan(task_id: str, reason: str) -> int:
+    """Record that the developer refused this plan, and send it back.
+
+    ``AWAITING_APPROVAL`` had exactly one exit: ``approve``. A developer who
+    read a plan and found it wrong had no recorded action at all -- the only
+    ways forward were to approve something they disagreed with, or to edit
+    state.json by hand, which is precisely the unearned evidence this workflow
+    exists to prevent. So the human gate was only half a gate: it could say
+    yes, and it could say nothing.
+
+    A rejection bumps ``plan_version`` and parks the task in REPLANNING, which
+    means the replanner produces ``plan-vN.json`` and the rejected plan stays on
+    disk under its own version. The reason is carried in ``failure_reason``, so
+    ``replan_context`` puts it in front of the planner: a rejection the
+    replanner cannot see is a rejection it will repeat.
+    """
+    state_path, state = load_state(task_id)
+
+    if state["status"] != "AWAITING_APPROVAL":
+        print(
+            f"ERROR: TASK {task_id} is in state {state['status']}; "
+            "rejection requires AWAITING_APPROVAL."
+        )
+        return 1
+
+    reason = (reason or "").strip()
+
+    if not reason:
+        print(
+            "ERROR: a rejection needs a reason. The replanner is given it "
+            "verbatim, and a plan bounced without one will come back the same."
+        )
+        return 1
+
+    plan_file = resolve_plan_file(task_id, state)
+    plan_version = state.get("plan_version", 1)
+    digest = sha256_of(plan_file) if plan_file.is_file() else None
+
+    record_event(
+        task_id,
+        "PLAN_REJECTED",
+        plan_version=plan_version,
+        plan_file=str(plan_file),
+        plan_sha256=digest,
+        reason=reason,
+        rejected_by="developer",
+    )
+    append_context_block(
+        task_id,
+        "orchestrator",
+        state["status"],
+        "decision",
+        "Developer rejected plan v%d: %s" % (plan_version, reason),
+        evidence=[str(plan_file)],
+    )
+
+    state["plan_version"] = plan_version + 1
+    state["status"] = "REPLANNING"
+    state["failure_reason"] = "plan-rejected: %s" % reason
+    save_state(state_path, state)
+
+    print(
+        f"Plan v{plan_version} rejected for {task_id}.\n"
+        f"  Reason: {reason}\n"
+        f"  Task moved to REPLANNING; next: orchestrator.py {task_id} run"
+    )
+    return 0
+
+
 REPLAN_MAX_ATTEMPTS = 2
 
 
@@ -3190,13 +3944,41 @@ def run_replan(task_id: str, failed_state: Optional[dict] = None) -> int:
         task_id, "REPLAN_ATTEMPTED", plan_version=state["plan_version"]
     )
 
+    feedback = ""
+    plan_file = None
+
     try:
-        plan_file = run_codex_replan(
-            task_id,
-            state["plan_version"],
-            previous_plan=previous_plan,
-            state=failed_state or state,
-        )
+        for attempt in range(1, CRITIC_MAX_ROUNDS + 1):
+            plan_file = run_codex_replan(
+                task_id,
+                state["plan_version"],
+                previous_plan=previous_plan,
+                state=failed_state or state,
+                extra_feedback=feedback,
+            )
+
+            if plan_file is None:
+                break
+
+            acceptable, ran, detail = critique_round(
+                task_id, plan_file, state, attempt
+            )
+
+            if not ran or acceptable:
+                if ran:
+                    print(f"Plan critic: pass (round {attempt}).")
+                break
+
+            if attempt >= CRITIC_MAX_ROUNDS:
+                print(
+                    f"Plan critic still objects after {CRITIC_MAX_ROUNDS} "
+                    "rounds. Presenting the plan to the developer with the "
+                    "critique recorded; read it before approving."
+                )
+                break
+
+            print(f"Plan critic: revise (round {attempt}). Replanning...")
+            feedback = critic_feedback(detail)
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
         # Land in a state something can act on, naming the real cause. Letting
         # this escape is what stranded the task.
@@ -3625,6 +4407,8 @@ def create_task(requirement_text: str, task_id: Optional[str] = None) -> str:
         "branch": None,
         "worktree": None,
         "failure_reason": None,
+        "baseline_file": None,
+        "baseline_sha256": None,
     }
     save_state(directory / "state.json", state)
 
@@ -4136,6 +4920,7 @@ USAGE = """Usage:
   orchestrator.py new "<requirement text>"
   orchestrator.py adr "<decision title>"
   orchestrator.py TASK-XXX <action>
+  orchestrator.py TASK-XXX reject "<reason>"
 
 Repo-level:
   preflight       check every precondition for a real run: both worker CLIs
@@ -4152,6 +4937,8 @@ Actions:
                   (blocked while clarifications are unanswered)
   plan            invoke the planning worker
   approve         record developer approval of the current plan
+  reject          record developer rejection of the current plan and send it
+                  back for a replan (needs a reason; the replanner is shown it)
   implement       invoke the implementation worker
   fix             re-invoke the implementer on a routed failure
   validate        run validation and record evidence
@@ -4172,6 +4959,20 @@ def main() -> int:
         try:
             return run_preflight()
         except (FileNotFoundError, RuntimeError, OSError) as exc:
+            print(f"ERROR: {exc}")
+            return 1
+
+    # `reject` carries the developer's reason, which the replanner is shown.
+    if len(sys.argv) == 4 and sys.argv[2] == "reject":
+        try:
+            with task_lock(sys.argv[1]):
+                return reject_plan(sys.argv[1], sys.argv[3])
+        except (
+            FileNotFoundError,
+            RuntimeError,
+            json.JSONDecodeError,
+            OSError,
+        ) as exc:
             print(f"ERROR: {exc}")
             return 1
 
