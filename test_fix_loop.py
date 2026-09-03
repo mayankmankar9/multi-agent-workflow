@@ -144,9 +144,51 @@ class FixLoopTests(TaskDirCase):
 
 
 class RouteFailureHandoffTests(TaskDirCase):
-    def test_route_failure_leaves_a_state_fix_can_act_on(self):
+    """CLAUDE_FIX is autonomous work inside an approved scope.
+
+    This test used to route with no plan and no approval on the tree at all,
+    and assert IMPLEMENTING anyway. That is the defect, not the contract: the
+    task landed in a state whose only exit is `fix`, and `fix` then refused for
+    want of the approval nothing had given. Routing now asks the question the
+    implement gate asks, before it claims the state.
+    """
+
+    def _approved(self):
+        self.write_requirement()
+        self.write_plan("plan.json", PLAN)
+        self.write_state(status="AWAITING_APPROVAL")
+
+        with quiet():
+            orch.approve_plan(self.task_id)
+
         self.write_state(
             status="FAILED",
+            failure_reason="Validation command failed with exit code 1",
+        )
+
+    def test_route_failure_leaves_a_state_fix_can_act_on(self):
+        """An approved plan authorises an in-scope fix under it."""
+        self._approved()
+
+        with quiet():
+            self.assertEqual(orch.route_failure(self.task_id), 0)
+
+        self.assertEqual(self.read_state()["status"], "IMPLEMENTING")
+        self.assertTrue(orch.has_event(self.task_id, "CLAUDE_FIX_STARTED"))
+
+    def test_a_bumped_version_alone_does_not_block_the_fix(self):
+        """The gate is the approval on the plan's bytes, not the counter.
+
+        A replan that has not landed leaves plan_file pointing at the approved
+        plan. That plan still authorises fixes under it, so the fix must not be
+        refused merely because the version counter moved.
+        """
+        self._approved()
+        # The rejection/replan bump, without a new plan having landed:
+        # plan_file still resolves to the approved plan.json.
+        self.write_state(
+            status="FAILED",
+            plan_version=2,
             failure_reason="Validation command failed with exit code 1",
         )
 

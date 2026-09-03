@@ -42,6 +42,40 @@ class SchemaFileTests(unittest.TestCase):
 
         self.assertIn("verify", criterion["required"])
 
+    def test_every_object_lists_all_its_properties_as_required(self):
+        """The schema is a structured-output schema, which forbids optional keys.
+
+        `codex exec --output-schema` passes this file straight to the API,
+        which rejects any object whose `required` omits a key in `properties`
+        -- with a 400 at plan time, after the developer has already waited for
+        a worker. Adding `depends_on` and `material` as optional properties
+        broke a replan exactly that way. A property that is genuinely optional
+        for the orchestrator is still required here, and made permissive in
+        `validate_plan` instead.
+        """
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        offenders = []
+
+        def walk(node, path):
+            if isinstance(node, dict):
+                if node.get("type") == "object" and "properties" in node:
+                    missing = set(node["properties"]) - set(
+                        node.get("required") or []
+                    )
+
+                    if missing:
+                        offenders.append((path, sorted(missing)))
+
+                for key, value in node.items():
+                    walk(value, "%s/%s" % (path, key))
+            elif isinstance(node, list):
+                for index, value in enumerate(node):
+                    walk(value, "%s[%d]" % (path, index))
+
+        walk(schema, "root")
+
+        self.assertEqual(offenders, [])
+
     def test_fixture_plan_satisfies_our_own_validator(self):
         self.assertEqual(orch.validate_plan(VALID_PLAN), [])
 

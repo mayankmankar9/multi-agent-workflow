@@ -54,6 +54,28 @@ orchestrator re-hashes the plan at implement time.
 - The canonical plan is `state.json.plan_file`; read it from there rather than
   assuming `plan.json`.
 
+Two different questions are asked of an approval, and they have different
+answers on purpose:
+
+- **May implementation begin?** Entering `IMPLEMENTING` from
+  `AWAITING_APPROVAL` means the developer has just decided on that specific
+  plan version, so `verify_approval` requires the approval to be filed under
+  it. A materially changed plan waits for its own approval.
+- **May a fix run inside an already-approved plan?** `CLAUDE_FIX` is
+  autonomous work *inside an approved scope*, so `fix_authorization` asks
+  whether an approval covers the **bytes** of the plan the worker would be
+  handed — not whether the version counter moved. A replan that has not landed
+  leaves `plan_file` pointing at the approved plan, and that plan still
+  authorises fixes under it. A rejection of those bytes revokes the approval; a
+  later re-approval reinstates it.
+
+`route_failure` asks the second question *before* claiming `IMPLEMENTING`. A
+state machine that authorises a transition its own gate then refuses is how a
+task gets stranded: with no approved plan there is no scope for a fix to be
+inside, so the route is overridden to `CODEX_REPLAN` (or
+`DEVELOPER_CLARIFICATION` when a candidate plan is already awaiting a
+decision), and the override is recorded rather than silent.
+
 ## Orchestrator-owned artifacts
 
 The orchestrator owns task **evidence**. A worker never writes these, and the

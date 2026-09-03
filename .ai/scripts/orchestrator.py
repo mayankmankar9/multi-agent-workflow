@@ -2077,10 +2077,20 @@ def implementer_argv() -> List[str]:
 def verify_approval(task_id: str, state: dict, plan_file: Path) -> int:
     """Confirm the plan on disk is the plan the developer approved.
 
-    Two failures are caught here. An approval recorded against an earlier
+    The gate for *entering* implementation, and deliberately the stricter of
+    the two authorisation checks: arriving here from AWAITING_APPROVAL means
+    the developer has just decided on this specific plan version, so the
+    approval must be filed under it. A materially changed plan cannot be
+    implemented until it has been approved in its own right.
+
+    Two failures are caught. An approval recorded against an earlier
     plan_version no longer counts, so a replan requires a fresh decision. And
-    the plan is re-hashed at implement time, closing the window in which a plan
-    could be edited between approve and implement with nothing noticing.
+    the plan is re-hashed here, closing the window in which a plan could be
+    edited between approve and implement with nothing noticing.
+
+    ``fix_authorization`` answers the *other* question -- whether a worker may
+    be pointed at an already-approved plan to fix work inside it -- and is
+    version-independent by design.
     """
     plan_version = state.get("plan_version", 1)
     approval = find_approval(task_id, plan_version)
@@ -2134,6 +2144,67 @@ def verify_approval(task_id: str, state: dict, plan_file: Path) -> int:
         return 1
 
     return 0
+
+
+def fix_authorization(task_id: str, state: dict) -> Tuple[bool, str, str]:
+    """Whether autonomous fix work is authorised, and under which plan.
+
+    ``CLAUDE_FIX`` is autonomous work *inside an approved scope*, so the
+    question is whether the plan the worker would be handed carries a developer
+    approval for its own bytes -- not whether the version counter has moved. A
+    replan that has not landed leaves ``plan_file`` pointing at the approved
+    plan, and that plan still authorises fixes under it. Blocking on the
+    counter alone would refuse legitimate work.
+
+    Digest-based, and replayed in order, because approval is a judgement about
+    a plan's content: a rejection of these bytes revokes an earlier approval of
+    them, and a later re-approval reinstates it.
+
+    This never widens what may be implemented. ``verify_approval`` still gates
+    entry from AWAITING_APPROVAL on the version, so a materially changed plan
+    waits for its own approval regardless of what this returns.
+
+    Returns ``(authorized, kind, message)``.
+    """
+    plan_file = resolve_plan_file(task_id, state)
+
+    if not plan_file.is_file():
+        return (
+            False,
+            "missing_plan",
+            "the plan file is missing: %s" % plan_file,
+        )
+
+    digest = sha256_of(plan_file)
+    approved = False
+    rejected = False
+
+    for event in iter_events(task_id):
+        if event.get("plan_sha256") != digest:
+            continue
+
+        if event.get("event") == "PLAN_APPROVED":
+            approved, rejected = True, False
+        elif event.get("event") == "PLAN_REJECTED":
+            rejected = True
+
+    if rejected:
+        # Not a technicality about versions: the developer read these exact
+        # bytes and said no. There is no approved scope for a fix to be inside.
+        return (
+            False,
+            "plan_rejected",
+            "the developer rejected the plan on disk (%s)" % plan_file,
+        )
+
+    if not approved:
+        return (
+            False,
+            "no_approval",
+            "no approval covers the bytes of %s" % plan_file,
+        )
+
+    return True, "approved", "plan %s is approved" % plan_file
 
 
 def run_implementation(task_id: str) -> int:
@@ -2455,15 +2526,35 @@ def run_fix(task_id: str) -> int:
 
     verify_implementation_branch(task_id, state)
 
+    # A precondition a fix cannot satisfy lands the task in FAILED rather than
+    # returning into IMPLEMENTING. IMPLEMENTING has exactly one exit -- this
+    # verb -- so a bare non-zero return here leaves the task in a state
+    # nothing can act on, which is the dead end `fix` was introduced to remove.
+    # FAILED is routable, and `route_failure` will not send it back here.
     plan_file = resolve_plan_file(task_id, state)
 
     if not plan_file.is_file():
-        print(f"ERROR: plan file is missing: {plan_file}")
-        return 1
+        return fail_implementation(
+            task_id,
+            state_path,
+            state,
+            f"fix-precondition: plan file is missing: {plan_file}",
+        )
 
-    # The plan is unchanged from the approved one, so the same binding applies.
-    if verify_approval(task_id, state, plan_file) != 0:
-        return 1
+    # The same question routing asked: does an approval cover these plan
+    # bytes. Asking it the same way is the point -- a state machine that
+    # authorises a transition its gate then refuses is how the task got
+    # stranded in the first place.
+    authorized, kind, message = fix_authorization(task_id, state)
+
+    if not authorized:
+        print("ERROR: fix is not authorised because %s." % message)
+        return fail_implementation(
+            task_id,
+            state_path,
+            state,
+            "fix-precondition: %s" % kind,
+        )
 
     # A fix follows an implementation, which captured the baseline. Refusing
     # here rather than capturing late is deliberate: a baseline taken after the
@@ -2472,7 +2563,12 @@ def run_fix(task_id: str) -> int:
         load_baseline(task_id)
     except RuntimeError as exc:
         print(f"ERROR: {exc}")
-        return 1
+        return fail_implementation(
+            task_id,
+            state_path,
+            state,
+            "fix-precondition: no verifiable task baseline",
+        )
 
     record_event(
         task_id,
@@ -3894,6 +3990,43 @@ def reject_plan(task_id: str, reason: str) -> int:
 
 
 REPLAN_MAX_ATTEMPTS = 2
+REPLAN_BUDGET_ENV = "ORCHESTRATOR_REPLAN_MAX_ATTEMPTS"
+
+
+def replan_budget() -> Tuple[int, Optional[str]]:
+    """The replan cap for this run, and the override that set it if one did.
+
+    The cap exists to stop a planner looping on the same failure. But it counts
+    attempts over a task's whole life, so it cannot distinguish that loop from a
+    plan being revised against a contract that did not exist when the earlier
+    versions were written. TASK-007 hit exactly that: three plans predating the
+    task-baseline rules, and no budget left to write one that satisfies them.
+
+    Rather than raise the default for every task, the developer raises it for
+    the run they are making, and the event log records that they did.
+
+    A malformed override raises rather than falling back: silently using the
+    default would grant the opposite of what was asked, and silently accepting
+    nonsense would grant an unbounded budget.
+    """
+    raw = (os.environ.get(REPLAN_BUDGET_ENV) or "").strip()
+
+    if not raw:
+        return REPLAN_MAX_ATTEMPTS, None
+
+    try:
+        limit = int(raw)
+    except ValueError:
+        raise RuntimeError(
+            "%s must be an integer, got %r" % (REPLAN_BUDGET_ENV, raw)
+        )
+
+    if limit < 1:
+        raise RuntimeError(
+            "%s must be at least 1, got %d" % (REPLAN_BUDGET_ENV, limit)
+        )
+
+    return limit, raw
 
 
 def count_replan_attempts(task_id: str) -> int:
@@ -3930,12 +4063,38 @@ def run_replan(task_id: str, failed_state: Optional[dict] = None) -> int:
         )
         return 1
 
-    if count_replan_attempts(task_id) >= REPLAN_MAX_ATTEMPTS:
+    try:
+        limit, override = replan_budget()
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    attempts = count_replan_attempts(task_id)
+
+    if attempts >= limit:
         print(
             f"Task {task_id} has reached the replan limit "
-            f"({REPLAN_MAX_ATTEMPTS}). Developer attention required."
+            f"({limit}). Developer attention required."
         )
         return 1
+
+    if override is not None:
+        # A raised budget is a developer decision. It belongs in the task's
+        # trail beside the attempt it authorised, not only in the shell that
+        # happened to run it.
+        record_event(
+            task_id,
+            "REPLAN_BUDGET_OVERRIDDEN",
+            limit=limit,
+            default=REPLAN_MAX_ATTEMPTS,
+            env=REPLAN_BUDGET_ENV,
+            attempts_used=attempts,
+        )
+        print(
+            f"Replan budget raised to {limit} for this run "
+            f"(default {REPLAN_MAX_ATTEMPTS}, via {REPLAN_BUDGET_ENV}); "
+            f"{attempts} of it already used."
+        )
 
     # state["plan_file"] still names the plan that failed: it is advanced only
     # once a replan succeeds.
@@ -4043,6 +4202,36 @@ def route_failure(task_id: str) -> int:
         rationale=detail.get("rationale"),
         note=detail.get("note"),
     )
+
+    if route == "CLAUDE_FIX":
+        # An approved plan authorises in-scope fixes under it, so this is not
+        # gated on the version counter. It is gated on whether the plan the
+        # worker would be handed is approved at all: with no approved plan
+        # there is no scope for the fix to be inside, and claiming IMPLEMENTING
+        # anyway strands the task where no verb accepts it.
+        authorized, kind, detail_message = fix_authorization(task_id, state)
+
+        if not authorized:
+            replacement = (
+                "CODEX_REPLAN"
+                if kind in ("plan_rejected", "missing_plan")
+                else "DEVELOPER_CLARIFICATION"
+            )
+            print(
+                f"Route overridden: CLAUDE_FIX is not authorised because "
+                f"{detail_message}.\n"
+                f"  Routing to {replacement} instead. Implementation work "
+                "needs an approved plan to be in scope of."
+            )
+            record_event(
+                task_id,
+                "FAILURE_ROUTE_OVERRIDDEN",
+                classifier_route="CLAUDE_FIX",
+                route=replacement,
+                reason=kind,
+                detail=detail_message,
+            )
+            route = replacement
 
     if route == "CLAUDE_FIX":
         state["status"] = "IMPLEMENTING"

@@ -157,6 +157,22 @@ class ReplanResumeTests(TaskDirCase):
         self.assertEqual(code, 1)
         self.assertIn("replan limit", out.getvalue())
 
+    def test_the_cap_still_holds_against_a_raised_budget(self):
+        """Raising the budget moves the limit; it does not remove it."""
+        self._parked()
+
+        for _ in range(3):
+            orch.record_event(self.task_id, "REPLAN_ATTEMPTED", plan_version=2)
+
+        with mock.patch.dict(
+            orch.os.environ, {orch.REPLAN_BUDGET_ENV: "3"}
+        ):
+            with quiet() as out:
+                code = orch.run_replan(self.task_id)
+
+        self.assertEqual(code, 1)
+        self.assertIn("replan limit", out.getvalue())
+
     def test_each_attempt_is_recorded(self):
         self._parked()
 
@@ -330,6 +346,133 @@ class ReplanIsCritiquedTests(TaskDirCase):
     def setUp(self):
         super().setUp()
         self._parked()
+
+
+class ReplanBudgetTests(TaskDirCase):
+    """The cap counts a task's whole life, so it needs a documented raise.
+
+    TASK-007 had three plans, all written before the task-baseline rules
+    existed, and no budget left to write one that satisfied them. The cap was
+    right to stop the loop and wrong as a dead end: a developer had no recorded
+    way to extend it, and the only alternatives were editing events.jsonl by
+    hand or raising the limit for every task forever.
+    """
+
+    def _parked(self):
+        self.write_requirement()
+        plan = self.write_plan("plan.json")
+        self.write_state(
+            status="REPLANNING", plan_version=2, plan_file=str(plan)
+        )
+
+    def _replan_with(self, value):
+        self._parked()
+
+        for _ in range(orch.REPLAN_MAX_ATTEMPTS):
+            orch.record_event(self.task_id, "REPLAN_ATTEMPTED", plan_version=2)
+
+        def fake_run(argv, **kwargs):
+            if worker_name(argv) == "claude":
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"verdict": "pass", "issues": []}),
+                    stderr="",
+                )
+
+            out = argv[argv.index("--output-last-message") + 1]
+            orch.Path(out).write_text(plan_json(), encoding="utf-8")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(
+            orch.os.environ, {orch.REPLAN_BUDGET_ENV: value}
+        ):
+            with mock.patch.object(
+                orch.subprocess, "run", side_effect=fake_run
+            ):
+                with quiet() as out:
+                    code = orch.run_replan(self.task_id)
+
+        return code, out.getvalue()
+
+    def test_the_default_is_unchanged_without_an_override(self):
+        limit, override = orch.replan_budget()
+
+        self.assertEqual(limit, orch.REPLAN_MAX_ATTEMPTS)
+        self.assertIsNone(override)
+
+    def test_an_override_raises_the_budget(self):
+        with mock.patch.dict(
+            orch.os.environ, {orch.REPLAN_BUDGET_ENV: "4"}
+        ):
+            limit, override = orch.replan_budget()
+
+        self.assertEqual(limit, 4)
+        self.assertEqual(override, "4")
+
+    def test_a_raised_budget_lets_an_exhausted_task_replan(self):
+        code, _ = self._replan_with("3")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["status"], "AWAITING_APPROVAL")
+
+    def test_the_raise_is_recorded_in_the_task_trail(self):
+        """Not only in the shell that ran it."""
+        self._replan_with("3")
+
+        raised = [
+            e for e in self.events() if e["event"] == "REPLAN_BUDGET_OVERRIDDEN"
+        ]
+
+        self.assertEqual(len(raised), 1)
+        self.assertEqual(raised[0]["limit"], 3)
+        self.assertEqual(raised[0]["default"], orch.REPLAN_MAX_ATTEMPTS)
+        self.assertEqual(raised[0]["attempts_used"], orch.REPLAN_MAX_ATTEMPTS)
+
+    def test_the_raise_is_reported_to_the_developer(self):
+        _, output = self._replan_with("3")
+
+        self.assertIn("Replan budget raised to 3", output)
+
+    def test_the_critic_still_runs_under_a_raised_budget(self):
+        self._replan_with("3")
+
+        critiques = [e for e in self.events() if e["event"] == "PLAN_CRITIQUED"]
+
+        self.assertTrue(critiques)
+        self.assertTrue(critiques[-1]["ran"])
+
+    def test_a_non_numeric_override_is_refused(self):
+        """Never silently fall back: that grants the opposite of the ask."""
+        with mock.patch.dict(
+            orch.os.environ, {orch.REPLAN_BUDGET_ENV: "lots"}
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                orch.replan_budget()
+
+        self.assertIn("must be an integer", str(caught.exception))
+
+    def test_a_zero_override_is_refused(self):
+        with mock.patch.dict(
+            orch.os.environ, {orch.REPLAN_BUDGET_ENV: "0"}
+        ):
+            with self.assertRaises(RuntimeError):
+                orch.replan_budget()
+
+    def test_a_malformed_override_stops_the_replan(self):
+        code, output = self._replan_with("lots")
+
+        self.assertEqual(code, 1)
+        self.assertIn("must be an integer", output)
+        self.assertEqual(self.read_state()["status"], "REPLANNING")
+
+    def test_no_attempt_is_consumed_when_the_override_is_malformed(self):
+        code, _ = self._replan_with("lots")
+
+        attempts = [
+            e for e in self.events() if e["event"] == "REPLAN_ATTEMPTED"
+        ]
+
+        self.assertEqual(len(attempts), orch.REPLAN_MAX_ATTEMPTS)
 
 
 class CritiqueRoundTests(unittest.TestCase):

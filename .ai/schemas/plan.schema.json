@@ -89,12 +89,14 @@
       "additionalProperties": false
     },
     "acceptanceCriterion": {
-      "description": "A criterion plus how it is verified. verify is a shell command run by the validate step, or the literal \"judge\" to route the statement to a reviewer agent (not yet implemented; treated as unverified).",
+      "description": "A criterion plus how it is verified. verify is a shell command run by the validate step, or the literal \"judge\" to route the statement to a reviewer agent (not yet implemented; treated as unverified). Every property is listed in required because this schema is passed to the planner as a structured-output schema, which rejects an optional property outright; the orchestrator's own validator treats depends_on and material as optional so that plans written before they existed still parse.",
       "type": "object",
       "required": [
         "id",
         "statement",
-        "verify"
+        "verify",
+        "depends_on",
+        "material"
       ],
       "properties": {
         "id": {
@@ -111,7 +113,7 @@
           "description": "Shell command that exits 0 when the criterion holds. Use the literal token {python} to invoke Python; the orchestrator expands it to the interpreter it is running on. Bare 'python' or 'python3' is an App Execution Alias stub on Windows that exits 9009 without running, so a criterion written that way fails regardless of the code. {python} is the only interpreter a criterion can reach: never invoke a second version ('py -3.9', 'python3.12'), because multi-version coverage belongs to the CI matrix and a missing interpreter is recorded as a failed criterion rather than an unrun one. Prefer a named test selector over 'unittest discover', which exits 0 on an empty suite."
         },
         "depends_on": {
-          "description": "Repo-relative paths this criterion is evidence about. Defaults to the plan's whole declared file set. The criterion counts as passed only if at least one of these changed since the task baseline: a command that exits 0 against files this task never touched shows the artifact was already there, not that the task produced it.",
+          "description": "Repo-relative paths this criterion is evidence about. Emit [] to fall back to the plan's whole declared file set. The criterion counts as passed only if at least one of these changed since the task baseline: a command that exits 0 against files this task never touched shows the artifact was already there, not that the task produced it.",
           "type": "array",
           "items": {
             "type": "string",
@@ -119,7 +121,7 @@
           }
         },
         "material": {
-          "description": "Whether passing this criterion is meant to demonstrate work this task produced. Default true. Set false only for a deliberate regression guard ('the existing suite still passes'), which is then recorded as a guard rather than as proof of new work. It lives in the plan's bytes, so the developer approves it.",
+          "description": "Whether passing this criterion is meant to demonstrate work this task produced. Emit true for a normal criterion. Emit false only for a deliberate regression guard ('the existing suite still passes'), which is then recorded as a guard rather than as proof of new work. It lives in the plan's bytes, so the developer approves it.",
           "type": "boolean"
         }
       },
