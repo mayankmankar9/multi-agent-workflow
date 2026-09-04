@@ -65,6 +65,58 @@ def constitution_path():
     return repo_root() / CONSTITUTION_RELATIVE
 
 
+def read_or_warn(path):
+    """Read injected context, saying so on stderr if part of it is unreadable.
+
+    This hook injects rather than blocks, so unlike the Stop guard it must not
+    refuse -- but it must not pretend either. An undecodable byte previously
+    raised out of the hook, and injection was lost silently because a
+    SessionStart failure does not stop the session. Returning what is readable
+    and naming the gap on stderr means the worker starts with less context and
+    somebody can see why.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        sys.stderr.write(
+            "session_start: %s is not valid UTF-8 (%s); "
+            "injecting without it.\n" % (path, exc)
+        )
+        return ""
+    except OSError as exc:
+        sys.stderr.write(
+            "session_start: %s could not be read (%s); "
+            "injecting without it.\n" % (path, exc)
+        )
+        return ""
+
+
+def emit(text):
+    """Write injected context without depending on the locale codec.
+
+    ``sys.stdout`` uses the locale encoding, which is cp1252 on Windows. A
+    block containing anything outside it -- the Japanese text TASK-006's own
+    tests write, say -- raised UnicodeEncodeError, the hook died, and the
+    blackboard injection this hook exists to guarantee was gone. That is the
+    same failure mode TASK-006 set out to remove, one layer further out.
+
+    The underlying buffer takes bytes, so encoding here is explicit and the
+    locale never gets a vote. `errors="replace"` on the fallback path keeps a
+    lone unencodable character from costing the whole injection.
+    """
+    data = text.encode("utf-8", errors="replace")
+    buffer = getattr(sys.stdout, "buffer", None)
+
+    if buffer is None:
+        # A replaced stdout (a test harness, a captured stream) may have no
+        # buffer. Fall back to the text layer, lossily rather than not at all.
+        sys.stdout.write(data.decode("utf-8", errors="replace"))
+        return
+
+    buffer.write(data)
+    buffer.flush()
+
+
 def blocks(task_id):
     path = task_directory(task_id) / CONTEXT_FILENAME
 
@@ -73,7 +125,7 @@ def blocks(task_id):
 
     found = []
 
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in read_or_warn(path).splitlines():
         if not line.strip():
             continue
 
@@ -94,8 +146,11 @@ def main():
     parts = []
     constitution = constitution_path()
 
+    # The pre-check keeps an absent constitution silent -- ordinary sessions
+    # outside a checkout that has one are not a fault. A constitution that
+    # exists and cannot be decoded is, so that read still degrades loudly.
     if constitution.is_file():
-        text = constitution.read_text(encoding="utf-8").strip()
+        text = read_or_warn(constitution).strip()
 
         if text:
             parts.append(
@@ -130,7 +185,7 @@ def main():
     if not parts:
         return 0
 
-    sys.stdout.write("\n\n".join(parts) + "\n")
+    emit("\n\n".join(parts) + "\n")
     return 0
 
 

@@ -52,6 +52,34 @@ def task_directory(task_id):
     return repo_root() / ".ai" / "tasks" / task_id
 
 
+class Unreadable(Exception):
+    """A file the guard must read could not be decoded.
+
+    Raised rather than swallowed so the caller blocks. Reading a
+    worker-writable artifact with a strict codec and no handler meant an
+    undecodable byte killed the script with exit 1 -- and exit 1 blocks
+    nothing, so the write-back guard simply did not run. Switching to UTF-8
+    made that worse, not better: the previous locale decode on Windows rejected
+    five byte values, while UTF-8 rejects any malformed high-byte sequence.
+
+    A guard that cannot read its own input must fail closed.
+    """
+
+
+def read_guarded(path):
+    """Read a file the guard's verdict depends on, or refuse to have a verdict."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise Unreadable(
+            "%s is not valid UTF-8 (%s). The guard cannot confirm the "
+            "write-back happened, so it refuses rather than assuming it did."
+            % (path, exc)
+        )
+    except OSError as exc:
+        raise Unreadable("%s could not be read (%s)." % (path, exc))
+
+
 def context_blocks(task_id):
     path = task_directory(task_id) / CONTEXT_FILENAME
 
@@ -60,7 +88,7 @@ def context_blocks(task_id):
 
     found = []
 
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in read_guarded(path).splitlines():
         if not line.strip():
             continue
 
@@ -87,18 +115,24 @@ def main():
 
     notes = task_dir / "implementation.md"
 
-    if not notes.is_file() or not notes.read_text(encoding="utf-8").strip():
-        problems.append(
-            "%s is missing or empty. Write what you changed, any deviation "
-            "from the approved plan, and anything you could not complete."
-            % notes
-        )
+    try:
+        if not notes.is_file() or not read_guarded(notes).strip():
+            problems.append(
+                "%s is missing or empty. Write what you changed, any deviation "
+                "from the approved plan, and anything you could not complete."
+                % notes
+            )
 
-    written = [
-        block
-        for block in context_blocks(task_id)
-        if block.get("author") and block["author"] != "orchestrator"
-    ]
+        written = [
+            block
+            for block in context_blocks(task_id)
+            if block.get("author") and block["author"] != "orchestrator"
+        ]
+    except Unreadable as exc:
+        # Block, do not die. Exit 1 here would let the session end with the
+        # guard silently skipped, which is the failure this catches.
+        sys.stderr.write("Session cannot end yet:\n\n- %s\n" % exc)
+        return BLOCK
 
     if not written:
         problems.append(

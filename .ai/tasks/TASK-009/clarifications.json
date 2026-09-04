@@ -1,0 +1,27 @@
+{
+  "task_id": "TASK-009",
+  "asked_at": "2026-09-04T17:21:04.375179+05:30",
+  "questions": [
+    {
+      "id": "Q-1",
+      "question": "In the reconciled `session_start.py`, keep `main`'s `constitution.is_file()` pre-check before the `read_or_warn()` call, or drop it and let `read_or_warn()` handle the missing/unreadable file?",
+      "why": "Only the *missing* constitution case differs, and it differs observably: with the pre-check, an absent `.ai/constitution.md` stays silent (matching `blocks()` and `stop_guard`'s `notes.is_file()`, and the existing `test_it_stays_quiet_outside_a_task` ethos); without it, every session in a repo with no constitution emits a `session_start: ... could not be read` warning on stderr. An existing-but-undecodable constitution warns either way. It also decides whether a new test asserts silence or asserts a warning on that path.",
+      "options": [
+        "Keep the is_file() pre-check \u2014 missing is silent, unreadable is loud, consistent with both hooks' existing pattern",
+        "Drop it \u2014 let read_or_warn()'s OSError branch report any constitution it could not read, including an absent one"
+      ],
+      "answer": "Keep main's constitution.is_file() pre-check, then read through read_or_warn(constitution) and label the injected section with CONSTITUTION_RELATIVE. Rationale: it preserves main's control flow exactly (CLAUDE.md: preserve backward compatibility unless explicitly changed) and matches the existing pattern in both hooks. A missing constitution stays silent; an existing-but-undecodable one warns on stderr. So a new test on this path asserts silence for absent and a stderr warning for undecodable."
+    },
+    {
+      "id": "Q-2",
+      "question": "Do the new interaction tests go into the existing `test_hook_resilience.py`, or into a new root-level test module of their own?",
+      "why": "It changes which files the plan declares (`files_to_modify` on TASK-007's test file vs `files_to_create`), and the repo pulls both ways: TASK-007 created a new file rather than extending `test_utf8_io.py`, but test modules here never import each other \u2014 shared harness lives in `_support.py` \u2014 so a new file must either duplicate `HookCase`/`run_hook`/`INVALID_UTF8`/`NON_CP1252` or move them into `_support.py`, widening the change beyond the two hooks and their tests.",
+      "options": [
+        "Extend test_hook_resilience.py, reusing HookCase in place",
+        "New module (e.g. test_hook_reconciliation.py) with its own small harness",
+        "New module, with HookCase lifted into _support.py so both share it"
+      ],
+      "answer": "Extend test_hook_resilience.py, reusing HookCase in place. No new test module, and do not touch _support.py. Decisive reason: that file must be modified regardless, because its HookCase.run_hook is itself defective after the merge. run_hook builds its environment as dict(os.environ) and overrides only ORCHESTRATOR_TASK_ID, but the merged task_directory() prefers ORCHESTRATOR_TASK_DIR unconditionally over cwd, and worker_env() exports exactly that to every worker. Verified against main's stop_guard.py with a fixture that satisfies the guard: with a HookCase-style environment the hook exits 0 (ALLOW); adding an inherited ORCHESTRATOR_TASK_DIR pointing elsewhere makes the same fixture exit 2 (BLOCK), with stderr naming the exported path rather than the fixture. So all 24 TASK-007 hook tests read the wrong tree whenever the suite runs inside an orchestrated worker session, which is exactly what `implement` does. run_hook must control ORCHESTRATOR_TASK_DIR, ORCHESTRATOR_REPO_ROOT and ORCHESTRATOR_CONSTITUTION explicitly rather than inherit them. This is the same ambient-environment hazard test_hardening.run_hook's own docstring warns about for ORCHESTRATOR_TASK_ID, one variable further out. So files_to_modify is exactly: .ai/hooks/stop_guard.py, .ai/hooks/session_start.py, test_hook_resilience.py; files_to_create is empty."
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "task_id": "TASK-009",
+  "plan_file": ".ai\\tasks\\TASK-009\\plan-v2.json",
+  "plan_stem": "plan-v2",
+  "plan_version": 2,
+  "round": 1,
+  "max_rounds": 2,
+  "written_at": "2026-09-04T17:51:57.592705+05:30",
+  "ran": true,
+  "verdict": "pass",
+  "acceptable": true,
+  "rounds_exhausted": false,
+  "issue_count": 4,
+  "blocking_count": 0,
+  "issues": [
+    {
+      "severity": "medium",
+      "issue": "AC-6's statement claims the scan catches conflict markers \"including markers hidden in comments or docstrings\", but the command only matches `line.startswith(('<<<<<<<','=======','>>>>>>>'))`. An indented marker \u2014 the common case inside a docstring or a nested block \u2014 is not caught, so the command does not settle the statement it carries.",
+      "suggestion": "Scan with leading whitespace stripped, e.g. `... if line.lstrip().startswith(prefixes)`, or use `re.match(r'^\\s*(<{7}|={7}|>{7})', line)`. Keep the rest of the criterion (py_compile + line report) unchanged."
+    },
+    {
+      "severity": "medium",
+      "issue": "AC-7 re-runs the entire repository suite in-process (`unittest.defaultTestLoader.discover('.')`) under the 300s acceptance timeout (`ACCEPTANCE_TIMEOUT_S`), duplicating `.ai/validation.json`'s `tests` check, which already runs full discovery under its own `VALIDATION_TIMEOUT_S`. This suite is subprocess-heavy (~24 modules that each spawn interpreters); a run that exceeds 300s is recorded as returncode 124 and fails the criterion for a reason unrelated to the reconciliation. In-process discovery also imports every test module into one process, which is not how the profile executes them.",
+      "suggestion": "Either drop AC-7 and let the validation profile's `tests` check carry the full-suite requirement, or narrow it to a subprocess invocation of the modules this change can plausibly break (e.g. `{python} -m unittest -v test_hook_resilience test_utf8_io test_worker_launch`) while keeping the non-empty-count assertion."
+    },
+    {
+      "severity": "low",
+      "issue": "Requirement item 5 constrains the resolution to run on py3.9 as well as py3.12, but no criterion can observe this (correctly noted in the requirement) and nothing in the plan reduces the risk beyond a prose constraint. A 3.10+ construct (match statement, `X | Y` annotations) would pass every local criterion and go red only in CI.",
+      "suggestion": "Add a cheap syntactic guard to AC-6's one-liner or the test module \u2014 e.g. reject `match `/`case ` statements and PEP 604 unions in the two hook sources \u2014 or require the implementer to record in `implementation.md` which constructs were checked for 3.9 compatibility."
+    },
+    {
+      "severity": "low",
+      "issue": "AC-2's statement asserts the test \"independently prov[es] both authoritative rooting\", but the corresponding test_strategy entry does not require a decoy blackboard in the cwd tree the way AC-1's does. It is still discriminating (a cwd fallback finds no blackboard and emits nothing), yet the failure mode then looks like 'nothing injected' rather than 'wrong tree read', which is a weaker signal than the statement claims.",
+      "suggestion": "Mirror AC-1's fixture design: place a valid ASCII decoy blackboard in `self.tmp/.ai/tasks/<id>/` and assert both that the non-cp1252 exported content is present and that the decoy content is absent, so a cwd-rooted resolution fails loudly and for the stated reason."
+    }
+  ],
+  "blocking": []
+}
