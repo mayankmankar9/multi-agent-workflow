@@ -8,6 +8,7 @@ same inputs that produced the failing plan.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -585,6 +586,272 @@ class HookBehaviourTests(TaskDirCase):
         )
 
         self.assertEqual(result.returncode, 0)
+
+
+class WorktreeHookCase(TaskDirCase):
+    """A checkout and a recorded worktree, with the hooks in both.
+
+    ``.claude/settings.json`` registers hooks as cwd-relative commands, so once
+    a worker's cwd is its recorded worktree the scripts that execute are *that
+    worktree's* copies. The evidence they must read is not there: the
+    blackboard, the constitution, ``implementation.md`` and the approved plan
+    are single-homed in the orchestrator checkout.
+    """
+
+    CHECKOUT_MARKER = "HOOK-COPY-CHECKOUT"
+    WORKTREE_MARKER = "HOOK-COPY-WORKTREE"
+    HOOK_SCRIPTS = ("session_start.py", "stop_guard.py")
+
+    def setUp(self):
+        super().setUp()
+
+        self.checkout = self.tmp
+        self.worktree = self.tmp / ".worktrees" / self.task_id
+        self.worktree.mkdir(parents=True)
+
+        self._install_hooks(self.checkout, self.CHECKOUT_MARKER)
+        self._install_hooks(self.worktree, self.WORKTREE_MARKER)
+
+        (self.checkout / ".ai" / "constitution.md").write_text(
+            "# Project constitution\n\nSENTINEL_CONSTITUTION\n", encoding="utf-8"
+        )
+        # A decoy in the worktree: everything a cwd-resolving hook would read,
+        # placed where reading it would be wrong.
+        self.decoy = self.worktree / ".ai" / "tasks" / self.task_id
+        self.decoy.mkdir(parents=True)
+        (self.decoy / "context.jsonl").write_text(
+            json.dumps(
+                {
+                    "block_id": "ctx-001",
+                    "type": "decision",
+                    "author": "claude",
+                    "phase": "IMPLEMENTING",
+                    "content": "DECOY_BLOCK_CONTENT",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (self.decoy / "implementation.md").write_text(
+            "decoy notes\n", encoding="utf-8"
+        )
+        (self.worktree / ".ai" / "constitution.md").write_text(
+            "DECOY_CONSTITUTION\n", encoding="utf-8"
+        )
+
+        self.write_state(
+            status="IMPLEMENTING", worktree=".worktrees/%s" % self.task_id
+        )
+
+    def _install_hooks(self, root, marker):
+        """Copy the real hooks in, made distinguishable by which copy ran.
+
+        The marker goes to stderr from inside ``main()``, so the hook's own
+        stdout contract -- what SessionStart injects -- is untouched.
+        """
+        directory = root / ".ai" / "hooks"
+        directory.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(HOOKS / "run", directory / "run")
+
+        for name in self.HOOK_SCRIPTS:
+            source = (HOOKS / name).read_text(encoding="utf-8")
+            marked = source.replace(
+                "def main():",
+                'def main():\n    sys.stderr.write("%s\\n")' % marker,
+                1,
+            )
+
+            self.assertIn(marker, marked, name)
+            (directory / name).write_text(marked, encoding="utf-8")
+
+    def _env(self, **overrides):
+        """A clean environment: no ORCHESTRATOR_* the caller did not ask for.
+
+        Necessary rather than tidy. These hooks read authoritative roots out of
+        the environment, so a suite run *inside* an orchestrated worker session
+        would otherwise inherit that session's roots and read the real
+        repository's evidence instead of the fixture's.
+        """
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("ORCHESTRATOR_")
+        }
+        environment.update(
+            {key: value for key, value in overrides.items() if value is not None}
+        )
+        return environment
+
+    def _authoritative_env(self):
+        """What ``worker_env`` exports for this task, built by the real thing."""
+        return self._env(**orch.worker_env(self.task_id))
+
+
+class WorktreeHookBehaviourTests(WorktreeHookCase):
+    def _run(self, script, cwd, env):
+        return subprocess.run(
+            [sys.executable, str(HOOKS / script)],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    def test_hooks_use_authoritative_task_directory(self):
+        orch.append_context_block(
+            self.task_id,
+            "codex",
+            "PLANNING",
+            "repo_finding",
+            "AUTHORITATIVE_BLOCK_CONTENT",
+        )
+        env = self._authoritative_env()
+
+        injected = self._run("session_start.py", self.worktree, env)
+
+        self.assertEqual(injected.returncode, 0)
+        self.assertIn("AUTHORITATIVE_BLOCK_CONTENT", injected.stdout)
+        self.assertIn("SENTINEL_CONSTITUTION", injected.stdout)
+        # The worktree's own copy of both would have been the wrong answer.
+        self.assertNotIn("DECOY_BLOCK_CONTENT", injected.stdout)
+        self.assertNotIn("DECOY_CONSTITUTION", injected.stdout)
+
+        # The Stop guard checks the checkout's notes, not the worktree's decoy
+        # -- otherwise a worker rooted elsewhere passes a guard it never met.
+        blocked = self._run("stop_guard.py", self.worktree, env)
+
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("implementation.md", blocked.stderr)
+
+        (self.task_path / "implementation.md").write_text("real notes\n")
+        orch.append_context_block(
+            self.task_id, "claude", "IMPLEMENTING", "deviation", "recorded"
+        )
+
+        allowed = self._run("stop_guard.py", self.worktree, env)
+
+        self.assertEqual(allowed.returncode, 0)
+
+    def test_hooks_retain_legacy_cwd_fallback(self):
+        """A session the orchestrator did not launch still works.
+
+        Only the task id is exported, which is the shape every session had
+        before the authoritative roots existed.
+        """
+        orch.append_context_block(
+            self.task_id,
+            "codex",
+            "PLANNING",
+            "repo_finding",
+            "LEGACY_BLOCK_CONTENT",
+        )
+        env = self._env(ORCHESTRATOR_TASK_ID=self.task_id)
+
+        injected = self._run("session_start.py", self.checkout, env)
+
+        self.assertEqual(injected.returncode, 0)
+        self.assertIn("LEGACY_BLOCK_CONTENT", injected.stdout)
+        self.assertIn("SENTINEL_CONSTITUTION", injected.stdout)
+
+        blocked = self._run("stop_guard.py", self.checkout, env)
+
+        self.assertEqual(blocked.returncode, 2)
+
+        (self.task_path / "implementation.md").write_text("notes\n")
+        orch.append_context_block(
+            self.task_id, "claude", "IMPLEMENTING", "decision", "x"
+        )
+
+        self.assertEqual(
+            self._run("stop_guard.py", self.checkout, env).returncode, 0
+        )
+
+
+@unittest.skipUnless(shutil.which("bash"), "bash not available")
+class WorktreeHookCopyAuthorityTests(WorktreeHookCase):
+    """Which copy executes is a decision, so it is asserted rather than assumed.
+
+    The recorded worktree's copy is authoritative *code*; the orchestrator
+    checkout is authoritative *evidence*. Both halves are checked here, through
+    the real cwd-relative command from ``.claude/settings.json`` -- running the
+    script by absolute path would prove nothing about what the harness does.
+    """
+
+    def _registered_command(self, event):
+        settings = json.loads(
+            (REPO_ROOT / ".claude" / "settings.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        commands = [
+            hook["command"]
+            for entry in settings["hooks"][event]
+            for hook in entry["hooks"]
+        ]
+
+        self.assertEqual(len(commands), 1, commands)
+        argv = commands[0].split()
+
+        self.assertEqual(argv[0], "bash", commands[0])
+        # Relative, which is exactly why the worktree's copy is the one that
+        # runs: the harness resolves it against the worker's cwd.
+        for token in argv[1:]:
+            self.assertFalse(Path(token).is_absolute(), token)
+
+        return [shutil.which("bash")] + argv[1:]
+
+    def _launch(self, event, env):
+        return subprocess.run(
+            self._registered_command(event),
+            cwd=str(self.worktree),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    def test_recorded_worktree_hook_copy_executes_with_orchestrator_evidence(
+        self,
+    ):
+        orch.append_context_block(
+            self.task_id,
+            "codex",
+            "PLANNING",
+            "repo_finding",
+            "AUTHORITATIVE_BLOCK_CONTENT",
+        )
+        env = self._authoritative_env()
+
+        injected = self._launch("SessionStart", env)
+
+        self.assertEqual(injected.returncode, 0, injected.stderr)
+        # The code that ran belongs to the worktree.
+        self.assertIn(self.WORKTREE_MARKER, injected.stderr)
+        self.assertNotIn(self.CHECKOUT_MARKER, injected.stderr)
+        # The evidence it read belongs to the checkout.
+        self.assertIn("AUTHORITATIVE_BLOCK_CONTENT", injected.stdout)
+        self.assertIn("SENTINEL_CONSTITUTION", injected.stdout)
+        self.assertNotIn("DECOY_BLOCK_CONTENT", injected.stdout)
+        self.assertNotIn("DECOY_CONSTITUTION", injected.stdout)
+
+        blocked = self._launch("Stop", env)
+
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn(self.WORKTREE_MARKER, blocked.stderr)
+        self.assertNotIn(self.CHECKOUT_MARKER, blocked.stderr)
+        # The worktree's decoy implementation.md and blackboard would have
+        # satisfied both obligations. The guard is not looking there.
+        self.assertIn("implementation.md", blocked.stderr)
+        self.assertIn(str(self.task_path.resolve()), blocked.stderr)
+
+        (self.task_path / "implementation.md").write_text("real notes\n")
+        orch.append_context_block(
+            self.task_id, "claude", "IMPLEMENTING", "deviation", "recorded"
+        )
+
+        allowed = self._launch("Stop", env)
+
+        self.assertEqual(allowed.returncode, 0)
+        self.assertIn(self.WORKTREE_MARKER, allowed.stderr)
 
 
 class SettingsTests(unittest.TestCase):

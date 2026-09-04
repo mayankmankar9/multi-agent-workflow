@@ -1,0 +1,207 @@
+{
+  "task_id": "TASK-008",
+  "timestamp": "2026-09-04T10:35:04.015421+05:30",
+  "dimensions": {
+    "correctness": {
+      "ran": true,
+      "findings": [
+        {
+          "severity": "medium",
+          "title": "F2's `foreign` classification cannot fire for worktrees the `worktree` verb actually records, and AC-7 proves it only at a path the orchestrator never produces",
+          "detail": "Structural ownership is established from two prefixes only: another open task's recorded `worktree` and its `.ai/tasks/<other-id>/` directory (other_open_tasks, orchestrator.py:3810-3817). Both prefix families are removed from every task manifest before classification ever runs: BASELINE_EXCLUDE_PREFIXES = ('.git/', '.worktrees/', '.ai/tasks/') at orchestrator.py:118, applied in baseline_excluded/enumerate_tree (3237-3282). run_worktree records exactly `.worktrees/<task-id>` (worktree_path, 5039-5040; state write 5094). Consequently, for any task whose worktree was created by the `worktree` verb, no path that could be classified `foreign` can appear in `delta['produced']`, so `summary['foreign']` in evaluate_diff_scope (3953-3955) is always empty and the classification is inert in the layout the orchestrator itself creates. AC-7 passes only because its fixture records task B's worktree at `sandboxes/TASK-998` \u2014 a location nothing in the orchestrator produces \u2014 and the fixture docstring states this explicitly (test_task_baseline.py:892-898). The `.ai/tasks/<other-id>/` half is likewise asserted by calling classify_foreign_paths directly (test_task_baseline.py:946-962) rather than through a delta. The net effect is that the only concurrency case the requirement cares about in practice (two open tasks touching shared source) is the documented residual, and the delivered mechanism does not change behaviour for real worktrees. Disclosed in implementation.md as a judgement call, but it means requirement 7 / AC-7 are satisfied by a fixture rather than by the production path.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3810,
+          "acceptance_criteria": [
+            "AC-7"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "A failed `git diff` is recorded as `committed_changed: []`, indistinguishable from \"nothing committed changed\"",
+          "detail": "changed_files_against_base returns [] on any non-zero git exit (orchestrator.py:3731-3732). evaluate_diff_scope calls it whenever the baseline recorded a head and stores the result verbatim as `summary['committed_changed']` (3932-3940). If the baseline head is unreachable in the execution root \u2014 a fresh worktree, a pruned/gc'd commit, a re-cloned tree \u2014 the evidence file reports an empty committed set and `committed_not_in_delta: []` with nothing recording that git could not answer. Requirement 8 explicitly chose omission over substitution for a missing `git.head`; the same conflation reappears here for an unanswerable one. Non-blocking evidence, but it is a claim of absence nothing verified.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3731,
+          "acceptance_criteria": [
+            "AC-8"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "Committed evidence uses three-dot diff, so a non-ancestor baseline head silently reverts to the fork point F3 was about",
+          "detail": "changed_files_against_base runs `git diff --name-only {base}...HEAD` (orchestrator.py:3723). Three dots diff from merge-base(base, HEAD), not from base. While the branch advances linearly from the captured baseline the two are identical, which is why AC-8 passes. After a rebase, amend or reset that makes the recorded baseline head no longer an ancestor of HEAD, the effective base becomes the merge base \u2014 i.e. the fork point \u2014 and `committed_changed` again lists branch history the task did not produce, which is the defect F3 exists to remove. `{base}..HEAD` would express the intended \"since the baseline commit\" exactly.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3723,
+          "acceptance_criteria": [
+            "AC-8"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "Recovery eligibility mixes attempt-scoped and whole-trail checks, so an interrupted `implement` after any earlier fix is not recoverable and `run` resumes it instead of stopping",
+          "detail": "last_implementation_attempt is attempt-scoped (orchestrator.py:2969-2990), but the CLAUDE_FIX_STARTED test uses has_event over the whole trail (3010). For the sequence FAILED -> CLAUDE_FIX -> fix -> validation fails -> CODEX_REPLAN -> approve -> implement -> killed, the current attempt is an uninterrupted-and-unterminated plain `implement`, yet `recover` refuses with \"the task carries CLAUDE_FIX_STARTED, so `fix` is its legal verb\". run_fix uses the same whole-trail check (2885), so the task is not stranded \u2014 but the interruption is never recorded as one, and run_driver's IMPLEMENTING branch takes the has_event(CLAUDE_FIX_STARTED) path (5542) and calls run_fix, i.e. `run` autonomously re-invokes the implementer on an interrupted implementation rather than stopping and naming `recover`. AC-19 does mandate the refusal and AC-6 only covers the no-CLAUDE_FIX_STARTED case, so this is inside the approved contract; flagging because the guarantee \"an interrupted implementation reaches a routable state through `recover`, and `run` never resumes one on its own\" holds only for tasks with no fix anywhere in their history.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3010,
+          "acceptance_criteria": [
+            "AC-1",
+            "AC-6",
+            "AC-19"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "`recover`'s unlocked write sequence is observable mid-update and its lock check is a TOCTOU",
+          "detail": "run_recover takes no per-task lock (UNLOCKED_ACTIONS, orchestrator.py:5908) and gates only on `lock_path.exists()` at 3116, then writes IMPLEMENTATION_INTERRUPTED (3173), then state.json (3189), then TASK_RECOVERED (3191). Two consequences. (a) Another orchestrator invocation can create the lock in the window between 3116 and 3189 and then read the pre-recovery IMPLEMENTING state while recover overwrites it; save_state is atomic so no torn file results, but last-writer-wins across two views of the state is possible. (b) IMPLEMENTATION_INTERRUPTED is not in IMPLEMENTATION_TERMINATING_EVENTS (171-176), so a process killed between 3173 and 3189 leaves the attempt still \"unterminated\" and a re-run records a second IMPLEMENTATION_INTERRUPTED for the same attempt \u2014 the enumeration's own docstring claims a missing entry would let recovery accept an attempt whose outcome was already recorded. Both follow from decision 4's no-lock design and neither strands a task, so this is reported as an observation on the new write sequence rather than a defect in the approved behaviour.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3116,
+          "acceptance_criteria": [
+            "AC-2",
+            "AC-3"
+          ]
+        }
+      ],
+      "checked": [
+        ".ai/tasks/TASK-008/requirement.md, plan-v4.json and implementation.md (context only)",
+        ".ai/scripts/orchestrator.py: repo_root/recorded_worktree/execution_root/authoritative_path/evidence_dir/worker_env, run_worker cwd+env, codex_argv and run_codex_planning/run_codex_replan output paths",
+        ".ai/scripts/orchestrator.py: last_implementation_attempt, recovery_eligibility, lock_holder, run_recover (reason gate, eligibility ordering, lock existence/override/unlink reporting, event sequence, state write), IMPLEMENTATION_TERMINATING_EVENTS, run_fix preconditions",
+        ".ai/scripts/orchestrator.py: run_plan failure handling and fail_planning, critique_file/normalise_critique_issues/persist_critique/critique_round, run_replan critique + failure paths",
+        ".ai/scripts/orchestrator.py: leave_failed, last_recorded_failure_reason, route_failure exits, run_validation blocking-vs-foreign handling and VALIDATED path",
+        ".ai/scripts/orchestrator.py: baseline_excluded/enumerate_tree/tree_manifest/capture_baseline/baseline_head/compute_task_delta, evaluate_diff_scope, evaluate_acceptance_criteria, path_under, other_open_tasks, classify_foreign_paths, changed_files_against_base, resolve_diff_base",
+        ".ai/scripts/orchestrator.py: ACTIONS/TEXT_ACTIONS/UNLOCKED_ACTIONS/IMPLEMENTING_EXITS/USAGE and main() argument dispatch, run_driver IMPLEMENTING branch, run_worktree, run_pr",
+        ".ai/hooks/pre_tool_use.py in full (protected patterns, path normalisation against worker/repo roots, approved_plan hash re-check, bash checks)",
+        ".ai/hooks/session_start.py and .ai/hooks/stop_guard.py in full (exported-root resolution and cwd fallback)",
+        "test_run_driver.py recovery fixtures and all Recover* / DocumentedLifecycleContract test classes",
+        "test_task_baseline.py ForeignTaskDeltaTests, test_worker_launch.py ExecutionRoot/RecordedWorktree/LegacyCheckout classes, test_hardening.py ProtectedCritiqueEvidenceTests and WorktreePreToolUseTests, test_plan_contract.py InitialPlanningFailureTests, test_fix_loop.py FailureReasonLifecycleTests, test_repo_hygiene.py workflow reader"
+      ]
+    },
+    "security": {
+      "ran": true,
+      "findings": [
+        {
+          "severity": "medium",
+          "title": "PreToolUse authorization inputs moved to unvalidated environment variables",
+          "detail": "The guard used to locate the approved plan and task evidence relative to its own cwd, i.e. inside the tree it was guarding. It now resolves them from ORCHESTRATOR_REPO_ROOT and ORCHESTRATOR_TASK_DIR. ORCHESTRATOR_TASK_DIR is taken verbatim (Path(raw), no exported_dir() is_dir check, no requirement that it sit under repo_root()/.ai/tasks/<ORCHESTRATOR_TASK_ID>), and approved_plan() then reads state.json, events.jsonl and the plan bytes from wherever it points. The sha256 re-check only proves internal consistency of that directory, so a self-consistent fake evidence dir (state.json naming a plan + a PLAN_APPROVED event with that plan's digest) authorizes writes to any .ai/scripts, .ai/schemas, .ai/hooks or .claude/settings.json path. A worker holds Bash and can create such a directory in its tree and launch a nested agent with these variables set. The implementation notes themselves record that these exports are decisive for authorization: inherited ORCHESTRATOR_* values made 14 existing hook tests authorize against the real TASK-008 plan instead of their fixture. A cheap cross-check (require the task dir to be repo_root/.ai/tasks/<task id>, or at least is_dir) would keep single-homing while removing the free choice of authority.",
+          "file": ".ai/hooks/pre_tool_use.py",
+          "line": 111,
+          "acceptance_criteria": [
+            "AC-28",
+            "AC-23"
+          ]
+        },
+        {
+          "severity": "medium",
+          "title": "Declared-path writes are allowed in the orchestrator checkout, where the task delta cannot see them",
+          "detail": "relative_to_repo() offers the candidate path relative to both worker_root() and repo_root(), and check_write allows an infrastructure path if any form is declared. So a worker rooted in .worktrees/<id> may write the checkout's copy of a declared file by absolute path \u2014 including .ai/scripts/orchestrator.py, the code the orchestrator executes on its next verb, and .ai/hooks/*. That the worker can reach the checkout is not hypothetical: run_claude_implementation now hands it absolute checkout paths and instructs it to write implementation.md there. Meanwhile capture_baseline (orchestrator.py:3378) and compute_task_delta (orchestrator.py:3490) enumerate only execution_root, so a write landing in the checkout appears in no baseline, no delta, no diff-scope violation list \u2014 it is outside the evidence the task is judged on, and outside this task's own reported 'exactly the 14 declared files' delta. The two-root leniency is deliberate and documented, but nothing in the guard or in validation distinguishes 'the declared file in the tree you were given' from 'the same-named file in the orchestrator's tree'.",
+          "file": ".ai/hooks/pre_tool_use.py",
+          "line": 185,
+          "acceptance_criteria": [
+            "AC-9",
+            "AC-28"
+          ]
+        },
+        {
+          "severity": "medium",
+          "title": "The enforcing hook copy is now branch content in the worker's own tree",
+          "detail": ".claude/settings.json registers hooks as cwd-relative commands (`bash .ai/hooks/run .ai/hooks/pre_tool_use.py`), and worker execution is now rooted in the recorded worktree, so the guard that authorizes each write is the worktree's copy \u2014 whatever the task's branch happens to carry \u2014 while the authority it checks against is the checkout's plan. Nothing verifies that the executing copy matches the checkout's, so a worktree whose branch carries a weakened pre_tool_use.py or .ai/hooks/run enforces nothing, silently (the module's own docstring notes exit 1 denies nothing). The reachable case is not exotic: this task's approved plan declares .ai/hooks/pre_tool_use.py, so the implementer rewrote, in its own worktree, the very guard copy that governed its subsequent tool calls in that session. I am recording this because the security consequence of the approved 'which copy executes' decision (AC-31) is that guard code provenance moved from the developer's checkout to the task branch; the decision itself was made knowingly.",
+          "file": ".claude/settings.json",
+          "line": 20,
+          "acceptance_criteria": [
+            "AC-31",
+            "AC-28"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "New path-resolution code in the guard can fail open on an unexpected exception",
+          "detail": "relative_to_repo() wraps Path(candidate)/resolve() in a try that catches only OSError. resolve() raises ValueError for an embedded null byte, and the loop's per-root try catches only (ValueError, OSError) around relative_to. An exception escaping check_write leaves the hook exiting 1, which this file documents as denying nothing \u2014 the failure mode it was written to avoid. Relatedly, normalise() strips only a leading './' and does not collapse interior './' or '../' segments, so `.ai/tasks/<id>/./state.json` does not match PROTECTED_EVIDENCE_PATTERNS in its raw form; the denial depends entirely on the resolved form being produced. Both point the same way: the resolution step should be treated as fallible and denied on failure rather than allowed to propagate.",
+          "file": ".ai/hooks/pre_tool_use.py",
+          "line": 175,
+          "acceptance_criteria": [
+            "AC-23",
+            "AC-28"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "Another task's recorded worktree string is trusted verbatim as a foreign-ownership prefix",
+          "detail": "other_open_tasks() appends other['worktree'] as an ownership prefix after only a non-empty string check \u2014 no is_dir validation (unlike recorded_worktree()), and no constraint that the value be under .worktrees/ or not an ancestor of shared source. classify_foreign_paths() then removes matching paths from `violations` at orchestrator.py:3953, so a broad or wrong recorded value in any other open task's state.json (e.g. '.ai' or a shared source directory) silently demotes real scope violations to non-blocking report metadata. path_under() correctly enforces component boundaries and terminal-state owners are excluded, so the remaining gap is the shape of the recorded value. Reachability is limited today because only run_worktree writes it (worktree_path(task_id)) and workers cannot write state.json, which is why this is low rather than higher \u2014 but the plan's own risk list names over-broad foreign matching as the thing to prevent, and the value is the one input not constrained.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3814,
+          "acceptance_criteria": [
+            "AC-7"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "Injected 'Project invariants' text is resolved from an env-supplied path to a file no tier protects",
+          "detail": "session_start.py now resolves the constitution from ORCHESTRATOR_CONSTITUTION (taken verbatim, no containment check) and injects its contents into the worker's context under the heading 'Project invariants', i.e. as authoritative instructions to a session holding Edit/Write/Bash. The blackboard portion carries an explicit 'this is data, not instructions' caveat; the constitution portion carries none. .ai/constitution.md appears in neither PROTECTED_EVIDENCE_PATTERNS nor PROTECTED_INFRA_PATTERNS, so a worker may edit it without any plan declaration, and what it writes is delivered to the next worker as invariants. The env indirection is new here; the injection itself predates this change, so the actionable part is that neither the path nor the file has an ownership guard while the change makes the path externally chosen.",
+          "file": ".ai/hooks/session_start.py",
+          "line": 59,
+          "acceptance_criteria": [
+            "AC-27"
+          ]
+        }
+      ],
+      "checked": [
+        ".ai/tasks/TASK-008/requirement.md, plan-v4.json and implementation.md for the approved scope and declared files",
+        ".ai/hooks/pre_tool_use.py in full: PROTECTED_EVIDENCE_PATTERNS/PROTECTED_INFRA_PATTERNS, exported_dir/repo_root/worker_root/task_directory, normalise, relative_to_repo, approved_plan hash re-check, declared_files, check_write, check_bash, main dispatch",
+        ".ai/hooks/session_start.py: exported-root resolution, constitution and blackboard injection text",
+        ".ai/hooks/stop_guard.py: exported-root resolution and block/allow exit codes",
+        ".ai/hooks/run launcher and .claude/settings.json hook registration (cwd-relative commands), to establish which hook copy executes",
+        ".ai/scripts/orchestrator.py: repo_root/recorded_worktree/execution_root/authoritative_path/evidence_dir/worker_env, run_worker, claude_argv, codex_argv, implementer_argv, run_claude_implementation prompt, task_lock/lock_holder, recovery_eligibility/run_recover including the lock-override path, persist_critique/critique_file, run_plan failure handling and fail_planning, evaluate_acceptance_criteria (shell=True runner and its cwd), evaluate_diff_scope, classify_foreign_paths/other_open_tasks/path_under, capture_baseline/compute_task_delta roots, resolve_diff_base, CLI dispatch tables and USAGE",
+        "argv construction for every worker/git subprocess touched by the change (list form, no shell) and the one shell=True site (acceptance verify commands)",
+        "environment-variable handling in the new tests (test_run_driver.py: mock.patch.dict and the explicitly-built CLI subprocess env)",
+        "grep across the worktree for a fixed set of credential patterns (private-key headers, ghp_, sk-, api_key/token/password/Authorization literals) and for the developer's email domain"
+      ]
+    },
+    "performance": {
+      "ran": true,
+      "findings": [
+        {
+          "severity": "low",
+          "title": "New hook-launching subprocesses in the test suite carry no timeout",
+          "detail": "The three subprocess launch helpers added by this change \u2014 `test_context_bus.WorktreeHookBehaviourTests._run` (line 692), `test_context_bus.WorktreeHookCopyAuthorityTests._launch` (line 804, which additionally goes through `bash .ai/hooks/run`) and `test_hardening.WorktreePreToolUseTests`' guard runner (line 878) \u2014 call `subprocess.run` without `timeout=`, while the other subprocess helpers added in the same change do set one (`test_run_driver.py:1074` uses `timeout=120`, `test_worker_launch.py:517/547` use `VERSION_TIMEOUT_S`). A child that wedges therefore blocks the whole run rather than failing its own test. That matters here specifically because AC-16 executes full discovery under a bounded acceptance timeout and has already been observed to hit it (routed failure recorded in the implementation notes, fix pass 4): a wedged hook consumes the entire budget and surfaces only as `returncode 124, timed out after 300s` with no indication of which test hung. The repository already treats this as a rule for production code \u2014 `test_orchestrator_infra.py:31-39` asserts `orchestrator.py` has at least as many `timeout=` arguments as `subprocess.run(` calls.",
+          "file": "test_context_bus.py",
+          "line": 692,
+          "acceptance_criteria": [
+            "AC-16",
+            "AC-27",
+            "AC-31",
+            "AC-28"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "`run_recover` re-parses events.jsonl three times per invocation",
+          "detail": "`recovery_eligibility` scans the whole event log twice \u2014 once via `has_event(task_id, \"CLAUDE_FIX_STARTED\")` (line 3010) and once via `last_implementation_attempt` (line 3017) \u2014 and then `run_recover` calls `last_implementation_attempt` a third time at line 3132 to recover the `started` event that `recovery_eligibility` had already computed and discarded (it returns only `(eligible, detail)`). Each call re-opens and re-JSON-parses every line of `events.jsonl`, which grows append-only for the life of a task. The cost is bounded and paid once per `recover` invocation, so this is a tidiness/scaling-with-trail-length issue rather than a hot path; returning the started event from `recovery_eligibility`, or scanning once for both facts, would remove two of the three passes.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3132,
+          "acceptance_criteria": [
+            "AC-1",
+            "AC-3"
+          ]
+        }
+      ],
+      "checked": [
+        "`.ai/scripts/orchestrator.py`: new/changed execution-root and evidence-path helpers (`repo_root`, `recorded_worktree`, `execution_root`, `authoritative_path`, `evidence_dir`, `worker_env`, `run_worker` cwd selection) for per-call state reloads and repeated filesystem work",
+        "`.ai/scripts/orchestrator.py`: baseline/delta path (`enumerate_tree`, `tree_manifest`, `digest_of_file`, `capture_baseline`, `compute_task_delta`) \u2014 confirmed `tree_manifest` is invoked once for capture and once per validation run (`run_validation:4046`), with the delta reused by both `evaluate_acceptance_criteria` and `evaluate_diff_scope` rather than recomputed",
+        "`.ai/scripts/orchestrator.py`: foreign-path classification (`other_open_tasks`, `path_under`, `classify_foreign_paths`) \u2014 `other_open_tasks` is loaded once per classification call, not per path; the remaining cost is O(changed paths x owning prefixes) with a small prefix set",
+        "`.ai/scripts/orchestrator.py`: committed-evidence change (`changed_files_against_base`, `resolve_diff_base`, `baseline_head`) \u2014 one `git diff` subprocess, and merge-base probing is no longer on the validation path",
+        "`.ai/scripts/orchestrator.py`: recovery path (`last_implementation_attempt`, `recovery_eligibility`, `lock_holder`, `run_recover`) and `run_driver`'s interrupted-IMPLEMENTING branch for repeated event-log scans and loop bounds (`RUN_MAX_STEPS`)",
+        "`.ai/scripts/orchestrator.py`: critique persistence (`critique_file`, `normalise_critique_issues`, `persist_critique`, `critique_round`) and `run_plan`/`fail_planning` for per-round I/O",
+        "Timeout coverage of every `subprocess.run` call site in `.ai/scripts/orchestrator.py` (lines 603, 679, 1379, 1498, 3258, 3347, 3656, 3722, 3746, 4413, 5065, 5081, 5118, 5207, 5660, 5695, 5742) \u2014 each passes an explicit `timeout=`",
+        "`.ai/hooks/pre_tool_use.py`, `.ai/hooks/session_start.py`, `.ai/hooks/stop_guard.py`: per-invocation file reads (state.json, plan bytes, events.jsonl, context.jsonl, implementation.md) and the added regex patterns/`relative_to_repo` candidate-form loop",
+        "Test-suite wall-time changes in the diff: `test_task_baseline.py` template-repo caching (`_build_starting_repo`, `_template_repo`, `BaselineCase.setUp`, `tearDownModule`) and `test_repo_hygiene.py`'s batched `git check-ignore --stdin -z` (`ignored_among`), including whether the template cache key (`TaskDirCase.task_id`, a class attribute) actually amortises across test methods",
+        "New subprocess-launching test helpers for timeout arguments: `test_context_bus.py:692`, `test_context_bus.py:804`, `test_hardening.py:878`, `test_run_driver.py:1067`, `test_worker_launch.py:513/543`",
+        "Whether new tests spawn live worker CLIs or full validation runs: `test_run_driver.RecoverValidationRouteTests` stubs the validation profile and mocks `classify_failure_with_agent`; `test_worker_launch.ExecutionRootCase._launch` doubles `subprocess.run` and only the acceptance half runs a real short-lived interpreter"
+      ]
+    }
+  },
+  "summary": {
+    "dimensions_ran": [
+      "correctness",
+      "performance",
+      "security"
+    ],
+    "dimensions_failed": {}
+  }
+}

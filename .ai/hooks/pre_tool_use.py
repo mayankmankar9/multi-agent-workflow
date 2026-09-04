@@ -16,13 +16,22 @@ its own input format would make the repo unusable after any harness update.
 Two tiers, because they answer different questions:
 
 *Evidence* -- state.json, events.jsonl, baseline.json, test-results.json,
-validation.md, review-findings.json -- is never writable by a worker. No plan
-can authorise a worker to write its own results; that is forging, and a plan
-that asked for it would be the clearest possible sign something had gone wrong.
-baseline.json belongs in this tier for a specific reason: it is the record of
-what the tree looked like before the worker ran, so a worker able to edit it
-could make its own output look pre-existing, or make pre-existing files look
-like work it did.
+validation.md, review-findings.json, critique-<plan-stem>-round-<round>.json --
+is never writable by a worker. No plan can authorise a worker to write its own
+results; that is forging, and a plan that asked for it would be the clearest
+possible sign something had gone wrong. baseline.json belongs in this tier for
+a specific reason: it is the record of what the tree looked like before the
+worker ran, so a worker able to edit it could make its own output look
+pre-existing, or make pre-existing files look like work it did. The critique
+artifacts belong here for the mirror-image reason: they are a read-only
+checker's verdict on a plan, and a worker able to author one could hand the
+developer a critique nothing criticised.
+
+This hook is registered as a cwd-relative command, so the copy that executes
+belongs to the worker's cwd -- its recorded worktree, once worker execution is
+rooted there. The approved plan and the task's evidence it authorises against
+live in the orchestrator checkout, which arrives as an absolute path from
+``worker_env()``; cwd remains the fallback outside an orchestrated run.
 
 *Infrastructure* -- .ai/scripts/, .ai/schemas/, .ai/hooks/, settings.json -- is
 denied unless the approved plan declares the file. This repository's only source
@@ -53,6 +62,11 @@ PROTECTED_EVIDENCE_PATTERNS = (
     r"\.ai/tasks/[^/]+/test-results\.json$",
     r"\.ai/tasks/[^/]+/validation\.md$",
     r"\.ai/tasks/[^/]+/review-findings\.json$",
+    # The whole naming family, not one example of it: a guard matching only
+    # `critique-plan-round-1.json` would leave `critique-plan-v4-round-2.json`
+    # forgeable, which is the artifact the developer actually reads at the
+    # approval gate.
+    r"\.ai/tasks/[^/]+/critique-[^/]+-round-[0-9]+\.json$",
 )
 
 # Workflow infrastructure. Denied to a worker unless the approved plan declares
@@ -69,7 +83,38 @@ WRITE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 # Git subcommands that publish or rewrite history.
 FORBIDDEN_GIT = {"commit", "push", "reset", "rebase", "tag"}
 
-TASKS = Path(".ai") / "tasks"
+TASKS_RELATIVE = Path(".ai") / "tasks"
+
+
+def exported_dir(name):
+    """An absolute directory the orchestrator exported, if it is usable."""
+    raw = (os.environ.get(name) or "").strip()
+
+    if not raw:
+        return None
+
+    candidate = Path(raw)
+
+    return candidate if candidate.is_dir() else None
+
+
+def repo_root():
+    """The orchestrator checkout: where the approved plan and evidence live."""
+    return exported_dir("ORCHESTRATOR_REPO_ROOT") or Path.cwd()
+
+
+def worker_root():
+    """The tree the worker is writing into: its worktree, or the checkout."""
+    return exported_dir("ORCHESTRATOR_WORKER_ROOT") or Path.cwd()
+
+
+def task_directory():
+    raw = (os.environ.get("ORCHESTRATOR_TASK_DIR") or "").strip()
+
+    if raw:
+        return Path(raw)
+
+    return repo_root() / TASKS_RELATIVE / task_id()
 
 
 def worker_session():
@@ -114,18 +159,36 @@ def matches(path, patterns):
 
 
 def relative_to_repo(path):
-    """Express an absolute path relative to the repo, for plan comparison.
+    """Candidate repo-relative forms of a path, for plan comparison.
 
     Agents pass absolute paths as often as relative ones. Comparing raw strings
     would let the same file be denied one way and allowed the other.
+
+    Two roots are tried, because a worker rooted in a recorded worktree writes
+    paths under that tree while the plan declares them relative to the
+    repository. Both resolve to the same declared path, and a guard that knew
+    only one of them would deny a write the developer had approved.
     """
     candidate = normalise(path)
+    forms = [candidate]
 
     try:
-        resolved = Path(candidate).resolve()
-        return resolved.relative_to(Path.cwd().resolve()).as_posix()
-    except (ValueError, OSError):
-        return candidate
+        resolved = Path(candidate)
+
+        if not resolved.is_absolute():
+            resolved = worker_root() / resolved
+
+        resolved = resolved.resolve()
+    except OSError:
+        return forms
+
+    for root in (worker_root(), repo_root()):
+        try:
+            forms.append(resolved.relative_to(root.resolve()).as_posix())
+        except (ValueError, OSError):
+            continue
+
+    return forms
 
 
 def approved_plan():
@@ -137,7 +200,7 @@ def approved_plan():
     the same rule verify_approval() applies before the implementer is invoked,
     enforced again at the point the write actually happens.
     """
-    directory = TASKS / task_id()
+    directory = task_directory()
 
     try:
         state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
@@ -149,10 +212,13 @@ def approved_plan():
 
     if not plan_path.is_absolute():
         # plan_file is recorded as a repo-relative path in some states and a
-        # bare filename in others.
+        # bare filename in others. Resolved against the orchestrator checkout,
+        # never the worker's cwd: the plan the developer approved is the one in
+        # the checkout, and a worktree copy of it would authorise its own bytes.
+        candidate = repo_root() / plan_name
         plan_path = (
-            Path(plan_name)
-            if Path(plan_name).is_file()
+            candidate
+            if candidate.is_file()
             else directory / Path(plan_name).name
         )
 
@@ -229,18 +295,20 @@ def check_write(tool_input):
         if not target:
             continue
 
-        if matches(target, PROTECTED_EVIDENCE_PATTERNS):
+        forms = relative_to_repo(target)
+
+        if any(matches(form, PROTECTED_EVIDENCE_PATTERNS) for form in forms):
             return deny(
                 "Denied: %s is orchestrator-owned evidence. The orchestrator "
-                "writes task state and validation results; a worker writing "
-                "them would be forging evidence. No plan can authorise this."
-                % target
+                "writes task state, validation results and plan critiques; a "
+                "worker writing them would be forging evidence. No plan can "
+                "authorise this." % target
             )
 
-        if matches(target, PROTECTED_INFRA_PATTERNS):
+        if any(matches(form, PROTECTED_INFRA_PATTERNS) for form in forms):
             declared = declared_files()
 
-            if relative_to_repo(target) in declared or normalise(target) in declared:
+            if any(form in declared for form in forms):
                 continue
 
             return deny(

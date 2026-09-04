@@ -1,13 +1,13 @@
 {
   "task_id": "TASK-008",
-  "status": "AWAITING_APPROVAL",
+  "status": "PR_READY",
   "created_at": "2026-09-03T09:19:50.214230+05:30",
-  "updated_at": "2026-09-03T10:52:15.722727+05:30",
+  "updated_at": "2026-09-04T10:35:04.600235+05:30",
   "plan_version": 4,
   "plan_file": ".ai\\tasks\\TASK-008\\plan-v4.json",
   "branch": null,
   "worktree": null,
-  "failure_reason": "plan-rejected: Plan v3 passed the critic, but four of its five remaining issues are closed by developer decision rather than accepted. (1) AC-3 carries two claims and its command settles one: the statement says lock refusal happens without using a PID liveness probe as authorization, but test_existing_lock_refuses_without_override only tests refusal in general, so an implementation that probes os.kill(pid,0) and proceeds when the pid looks dead would satisfy the command while violating decision 4. Add an explicit dead-PID test proving PID liveness cannot authorize recovery; pid data may be advisory detail in the event only. (2) Constraint 3 keeps recovery metadata out of state.json because task-state.schema.json sets additionalProperties false, but no criterion enforces it - validate the post-recovery state.json against that schema and assert it passes. (3) The declared file list can strand the implementer. Rooting subprocesses at the recorded worktree most plausibly changes worker_env, and test_preflight.py (which calls orch.worker_env for a task with no state or worktree), test_worktree_pr.py, test_validation_profile.py and test_review_package.py all exercise that or cwd/merge-base behaviour while undeclared. AC-16 requires the whole suite to pass, so a behaviour change breaking any of them leaves the implementer unable to fix it (undeclared write, denied at the tool boundary) and unable to leave it (criterion fails). Re-evaluate and correct the file list: preferably design the change to be backward compatible and state in the plan why each module is unaffected, otherwise declare only those that genuinely must change, remembering a declared file left byte-identical fails as declared-but-unchanged. Do not leave a path where AC-16 fails while the implementer is forbidden to fix the failing test. (5) Make hook resolution authoritative and testable. .claude/settings.json registers hooks as cwd-relative commands, so once worker cwd is the recorded worktree the scripts that execute are that worktree copies, not the orchestrator checkout copies. Decide explicitly which copy is authoritative, state it in the plan, and add a criterion proving the intended copy ran - AC-27 and AC-28 currently pass either way, so neither settles it. Issue 4 (the ADR for worktree-rooted execution with single-homed evidence) may remain a documented non-blocking risk; write it only if it falls out naturally, do not expand scope. requirement.md now carries criteria 24-27 covering all of the above. KEEP v3 otherwise in full: objective, the 15 requirements, all 28 existing criteria, constraints 1-18 including constraint 17 about extending fd35909 rather than re-deriving it, and risks 4, 7 and 10.",
-  "baseline_file": null,
-  "baseline_sha256": null
+  "failure_reason": null,
+  "baseline_file": ".ai\\tasks\\TASK-008\\baseline.json",
+  "baseline_sha256": "682497c011ed3c98296d0069d1171502fdcd4ff61914a4eaf74b58d66ca15594"
 }

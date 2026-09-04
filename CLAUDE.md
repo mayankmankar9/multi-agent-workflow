@@ -88,6 +88,12 @@ to write its own verdict:
 - `.ai/tasks/*/test-results.json`
 - `.ai/tasks/*/validation.md`
 - `.ai/tasks/*/review-findings.json`
+- `.ai/tasks/*/critique-<plan-stem>-round-<round>.json`
+
+The last one is a read-only checker's verdict on a plan, which is why it is in
+this tier rather than merely conventional: a worker able to author a critique
+could hand the developer a critique nothing criticised. The guard matches the
+whole naming family, not one example of it.
 
 Workflow **infrastructure** — `.ai/scripts/`, `.ai/schemas/`, `.ai/hooks/`,
 `.claude/settings.json` — is writable by a worker only when the approved plan
@@ -101,9 +107,9 @@ Never `git commit` or `git push` unless the developer explicitly asks.
 ## Verbs
 
 ```
-preflight | new | adr | status | context | run | clarify | advance | plan |
-approve | implement | fix | validate | review | route-failure | worktree | pr |
-complete
+preflight | new | adr | status | context | cost | run | clarify | advance |
+plan | approve | reject | implement | fix | recover | validate | review |
+route-failure | replan | worktree | pr | complete
 ```
 
 - `preflight` checks every precondition for a real run and executes what it
@@ -116,15 +122,69 @@ complete
   refuses to leave `ANALYZING` while any answer is missing.
 - `run` advances until an approval gate, a terminal state, or a failure.
   Idempotent; safe to re-run from any state.
-- `fix` is the legal exit from `IMPLEMENTING` after `route-failure` has recorded
-  a `CLAUDE_FIX_STARTED` event. It re-invokes the implementer with the failure
-  evidence attached. When fixing: fix the cause, and never weaken or delete
-  tests to make them pass.
+- `IMPLEMENTING` exits: `fix` | `recover`. Nothing else accepts that state.
+- `fix` handles the routed-failure entry into `IMPLEMENTING`, after
+  `route-failure` has recorded a `CLAUDE_FIX_STARTED` event. It re-invokes the
+  implementer with the failure evidence attached. When fixing: fix the cause,
+  and never weaken or delete tests to make them pass.
+- `recover` handles the other entry: an `implement` run killed between
+  `IMPLEMENTATION_STARTED` and its outcome. It takes a reason, records the
+  interruption as an attributable human assertion, and moves the task to
+  `FAILED`, which `route-failure` then classifies. It does not resume, re-run,
+  validate or complete anything, and it never touches the work on disk — a
+  recovered task still reaches `VALIDATED` only by running validation.
+  It is fail-closed: it refuses a task that is not `IMPLEMENTING`, one whose
+  attempt already has a terminating event, one already carrying
+  `CLAUDE_FIX_STARTED`, and any task with a `.lock` unless
+  `ORCHESTRATOR_RECOVER_LOCK_OVERRIDE` names the developer asserting the lock
+  is stale. A recorded pid is advisory detail in the event and never
+  authorisation: `os.kill(pid, 0)` is unsafe on Windows, where Python maps a
+  non-CTRL signal to `TerminateProcess`.
 - `pr` is opt-in (`ORCHESTRATOR_ENABLE_PR=1`) because it pushes the branch.
 - `complete` is blocked while CI is failing or pending.
 
-Mutating verbs take a per-task lock. `status` does not, so it stays readable
-while another invocation is running.
+Mutating verbs take a per-task lock. `status`, `context` and `cost` do not, so
+they stay readable while another invocation is running — and neither does
+`recover`, whose whole subject is a lock an interrupted run left behind.
+
+## A task's worktree is where its work happens
+
+`worktree` creates the tree and records it in `state.worktree`. That record is
+now read: a task's worker subprocesses, acceptance commands, validation checks,
+task-delta manifests and git corroboration are all rooted in the recorded
+worktree. A task whose `worktree` is null — every task that predates this —
+falls back to the orchestrator checkout, which is also the fallback for a
+recorded path that is no longer a directory.
+
+Evidence stays single-homed in the orchestrator checkout. Two consequences:
+
+- `.claude/settings.json` registers hooks as cwd-relative commands, so the hook
+  code that **executes** is the recorded worktree's copy. That is deliberate:
+  the worker's own tree is what a cwd-relative command names.
+- That copy reads the authoritative blackboard, constitution, approved plan and
+  Stop evidence from absolute paths the orchestrator exports —
+  `ORCHESTRATOR_REPO_ROOT`, `ORCHESTRATOR_TASK_DIR`,
+  `ORCHESTRATOR_CONSTITUTION`, `ORCHESTRATOR_WORKER_ROOT`. Without them a
+  worktree copy would inject an empty blackboard, check the Stop guard against
+  the wrong notes, and authorise writes against the wrong plan. Resolution
+  falls back to cwd when they are absent, so a session the orchestrator did not
+  launch is unaffected.
+
+`committed_changed` starts at the commit the baseline recorded, not at
+merge-base(`main`, HEAD). On a branch several commits ahead the fork point
+listed everything the branch had ever carried — 74 files for TASK-007, none of
+which that task produced. A baseline with no recorded `git.head` gets no
+committed evidence at all; omitting it is honest, substituting a different base
+is not.
+
+A path that structurally belongs to another **open** task — under its recorded
+worktree, or under its `.ai/tasks/<id>/` — is recorded in a non-blocking
+`foreign` list rather than counted as this task's scope violation. Ownership is
+structural only: another task's plan is never read, because that would make one
+task's plan an authorisation input for another task's validation. The residual
+case is known and accepted: a concurrent open task with no recorded worktree
+that edits shared source is not structurally attributable, and still lands in
+this task's delta as a violation.
 
 ## The plan is a contract, not a document
 
@@ -142,6 +202,15 @@ Two parts of it are **enforced at validation time**:
 
 So declare every file you will touch, and do not treat an unverifiable
 criterion as satisfied.
+
+Each completed critique round is persisted to
+`.ai/tasks/<task-id>/critique-<plan-stem>-round-<round>.json`, carrying the
+critic's issue text and severities, the plan version and the round. When the
+critic still objects after its last round, that file is the one to read before
+approving; because the name identifies both the plan and the round, a stale
+round cannot masquerade as the current one. It used to be counted and not
+recorded — the issue text went to stdout and nowhere else, so a developer told
+two blocking issues existed had no way to read them.
 
 ## A task must show it produced the change
 
