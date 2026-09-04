@@ -1,0 +1,162 @@
+{
+  "task_id": "TASK-007",
+  "timestamp": "2026-09-04T14:31:55.212308+05:30",
+  "dimensions": {
+    "correctness": {
+      "ran": true,
+      "findings": [
+        {
+          "severity": "medium",
+          "title": "The AC-2 stdout-encoding regression guard cannot fail on the only platform CI runs",
+          "detail": "`run_hook` deliberately strips PYTHONIOENCODING and PYTHONUTF8 so the child's stdout uses the locale codec. That makes `test_stdout_is_utf8_not_the_locale_codec`, `test_non_cp1252_content_actually_reaches_stdout` and `test_non_cp1252_content_does_not_crash_the_hook` meaningful on the developer's Windows box (cp1252) but tautological on ubuntu-latest, whose locale codec is already UTF-8: the pre-fix `sys.stdout.write(...)` implementation passes all three there. `.github/workflows/ci.yml:14` pins `runs-on: ubuntu-latest` for both matrix entries, so reverting `emit()` to a plain `sys.stdout.write` would be caught by nothing in CI except the source-text grep in `test_session_start_encodes_its_output_explicitly`. Requirement AC-2 states the claim explicitly as \"on Windows\". A platform-independent version is available without touching ci.yml: set `PYTHONIOENCODING=cp1252` (rather than clearing it) for one dedicated test, which makes the old code raise UnicodeEncodeError on any host.",
+          "file": "test_hook_resilience.py",
+          "line": 78,
+          "acceptance_criteria": [
+            "AC-2"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "Mutation harness asserts the mutant failed, but not that it failed for the encoding reason",
+          "detail": "`assert_removing_encoding_flips` accepts any non-successful `TestResult` from the mutated module. `why_it_failed` is computed only for the pass-side message, so a mutant that errors for an unrelated reason (an exec-time difference, a setUp problem, a temp-dir failure) satisfies `assertFalse(after.wasSuccessful())` and the test still reports the encoding as covered. The uniqueness assertion on the mutation target and the clean-run pass reduce but do not remove this: asserting that the failure text mentions the codec/decode error (or that the failure is a UnicodeDecodeError/byte mismatch) would close it.",
+          "file": "test_utf8_io.py",
+          "line": 689,
+          "acceptance_criteria": [
+            "AC-3"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "INVALID_UTF8's comment misstates cp1252, undercutting the fixture's stated purpose",
+          "detail": "The fixture is annotated \"Valid in cp1252: a lone 0x81 continuation byte\", but 0x81 is one of exactly five bytes cp1252 leaves undefined (0x81, 0x8D, 0x8F, 0x90, 0x9D) and it raises UnicodeDecodeError under cp1252 too. The module docstring and the requirement build their argument on UTF-8 rejecting byte sequences cp1252 accepts, so this fixture demonstrates the narrow overlap rather than the widened surface it is described as covering. The assertions (exit 2, \"not valid UTF-8\" on stderr) remain valid either way; only the fixture's claim is wrong. A byte such as 0x92 (valid cp1252 U+2019, invalid UTF-8) would match the comment.",
+          "file": "test_hook_resilience.py",
+          "line": 56,
+          "acceptance_criteria": [
+            "AC-1"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "emit()'s no-buffer fallback can still lose injection, and the test cannot detect it",
+          "detail": "When `sys.stdout` has no `.buffer`, `emit` writes a str to the text layer. If that replaced stream carries a lossy codec (the realistic Windows case: a cp1252 text stream), `sys.stdout.write` raises UnicodeEncodeError, the hook dies and the injection is lost - the same F3 failure mode, one branch over. `test_stdout_without_a_buffer_still_emits` exercises the branch with `io.StringIO`, which encodes nothing and accepts any character, so it proves only that the branch exists and does not raise AttributeError. Plan v5 acknowledges the limitation in its risks, so this is a residual gap rather than a plan deviation; a `try/except UnicodeEncodeError` re-write through `sys.stdout.encoding` with `errors=\"replace\"` would make the fallback degrade instead of dying.",
+          "file": ".ai/hooks/session_start.py",
+          "line": 69,
+          "acceptance_criteria": [
+            "AC-2"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "Two exit-code/encoding contracts are asserted by grepping source text, not by behaviour",
+          "detail": "`test_stop_guard_never_returns_one` asserts the literal string \"return 1\" is absent from stop_guard.py, and `test_session_start_encodes_its_output_explicitly` asserts 'encode(\"utf-8\"' is present in session_start.py. Neither can fail for the defect class it names: F1 was an exit 1 produced by an *unhandled exception*, not by a `return 1` statement, and the encoding grep passes even if `emit` is never called or its result discarded. The behavioural subprocess tests in the same file carry the real signal; these two read as coverage of the exit-code contract while asserting the implementation's text.",
+          "file": "test_hook_resilience.py",
+          "line": 269,
+          "acceptance_criteria": [
+            "AC-1",
+            "AC-2"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "Requirement AC-3's \"no test in test_utf8_io.py\" is proven only for four named methods",
+          "detail": "Plan v5 narrows AC-3 to four mutation regressions and those are correctly built. Against the broader requirement wording, `test_requirement_text_round_trips_through_task_creation` remains unguarded: it depends on `create_task`'s `write_text(..., encoding=\"utf-8\")` at orchestrator.py:4584, and with that argument removed it still passes on any UTF-8-locale host - which is where CI runs. The restored tests' docstrings point at this test as the place \"the encoding claim\" actually lives, so its lack of a mutation guard matters more than it otherwise would. The existing `omitted_encoding_is_utf16` harness would extend to it directly.",
+          "file": "test_utf8_io.py",
+          "line": 499,
+          "acceptance_criteria": [
+            "AC-3"
+          ]
+        }
+      ],
+      "checked": [
+        "Requirement TASK-007/requirement.md (F1-F6, AC-1..AC-5) and plan-v5.json requirements/acceptance_criteria/constraints, read as the contract for this change",
+        "implementation.md, including the fix-run note claiming no source edits and the two-file delta vs baseline",
+        "`.ai/hooks/stop_guard.py` in full: `Unreadable`, `read_guarded`, `context_blocks`, `main` exit-code paths (ALLOW/BLOCK, never 1) and the short-circuit around a missing implementation.md",
+        "`.ai/hooks/session_start.py` in full: `read_or_warn` degradation, `emit` buffer path and no-buffer fallback, `blocks`, `main`",
+        "`test_hook_resilience.py` in full: `load_hook`, `HookCase.run_hook` environment handling, StopGuardFailsClosedTests, SessionStartEmitsUtf8Tests (incl. the new `test_stdout_without_a_buffer_still_emits`), SessionStartDegradesLoudlyTests, HookExitCodeContractTests",
+        "`test_utf8_io.py` in full: `is_binary_mode` positional/keyword scan, `calls_in_source`/`text_io_calls` and `_CALL_CACHE`, `UnescapedJson`, `orchestrator_module`, `omitted_encoding_is_utf16`, `run_round_trip`, the restored F4 tests, the strengthened F5 test, the four mutation regressions, BinaryModeClassificationTests, AuditCacheTests, Python39CompatibilityTests",
+        "Cross-checked the mutation targets against the real production call sites: `orchestrator.py:918` (`context_file(task_id).open(\"a\", encoding=\"utf-8\")`, `json.dump(..., sort_keys=True)`) and `orchestrator.py:865` (`for line in path.read_text(encoding=\"utf-8\").splitlines():`), including uniqueness vs the similar line at 961",
+        "`_support.py` `TaskDirCase.setUp`/cleanups, since the mutation harness re-runs those tests nested",
+        "`.github/workflows/ci.yml` against the literal strings AC-6's verify command greps for, and the runner OS/matrix",
+        "Python 3.9 vs 3.12 signatures relied on by the `Path.open` shim (`mode, buffering, encoding, errors, newline`) and by `Path.read_text`'s `io.text_encoding` sentinel on 3.10+",
+        "Existing callers of the hooks in `test_context_bus.py` for behaviour the hardening could have broken",
+        "Note: I have no Bash tool, so I did not execute git or the test suite; this review is of the working-tree contents of the files above."
+      ]
+    },
+    "security": {
+      "ran": true,
+      "findings": [
+        {
+          "severity": "low",
+          "title": "SessionStart now reliably injects arbitrary repository text into a write-capable worker's context",
+          "detail": "emit() (session_start.py:50-73) replaces locale-encoded stdout with an explicit UTF-8 byte write, plus a lossy text fallback. That is the right fix for the lost-injection bug, but it also means blackboard block content and .ai/constitution.md text that previously killed the hook (UnicodeEncodeError on non-cp1252 characters) is now delivered verbatim into the prompt of workers that hold Edit/Write/Bash. The delivered payload can now include full non-ASCII content \u2014 homoglyphs, bidi controls, zero-width characters \u2014 assembled from files any contributor can modify (main(), session_start.py:110-137). The only mitigation is the trailing advisory sentence at session_start.py:128-131, and it is appended to the blocks section only; the constitution section (session_start.py:104-108) is emitted with no data-not-instructions framing. No sanitisation or control-character stripping is applied on the way out. Impact is bounded because the repo's own files are the source and the framing sentence exists, so this is a widened surface rather than a demonstrated exploit.",
+          "file": ".ai/hooks/session_start.py",
+          "line": 63,
+          "acceptance_criteria": [
+            "AC-2"
+          ]
+        }
+      ],
+      "checked": [
+        ".ai/hooks/stop_guard.py in full (Unreadable/read_guarded fail-closed path, exit-code handling, env-driven task path construction, stderr message content)",
+        ".ai/hooks/session_start.py in full (read_or_warn degradation, emit() explicit UTF-8 encoding and no-buffer text fallback, blackboard/constitution assembly into stdout)",
+        "test_hook_resilience.py in full (subprocess invocation shape, env handling, temp-tree fixtures, direct hook import via importlib)",
+        "test_utf8_io.py in full (calls_in_source/text_io_calls AST audit, _CALL_CACHE, orchestrator_module exec of orchestrator source, omitted_encoding_is_utf16 Path.open shim and its restoration, ast.parse counter and its restoration, mutation targets)",
+        "grep across all *.py for shell=True, os.system, eval(, exec( to locate command-construction surfaces in and around the changed files",
+        "grep for ORCHESTRATOR_SKIP_STOP_GUARD to see where the guard bypass is set (only .ai/hooks/stop_guard.py and test_context_bus.py, the latter outside this change)",
+        "module-level side-effect scan of .ai/scripts/orchestrator.py (mkdir/write_text/open/subprocess/environ at import scope) because test_utf8_io.orchestrator_module exec()s that source in-process \u2014 none found",
+        ".ai/tasks/TASK-007/requirement.md, plan-v5.json and implementation.md for declared scope and constraints"
+      ]
+    },
+    "performance": {
+      "ran": true,
+      "findings": [
+        {
+          "severity": "low",
+          "title": "Mutation harness recompiles and re-executes the ~4000-line orchestrator module 8 times per suite run",
+          "detail": "assert_removing_encoding_flips reads ORCHESTRATOR_PATH and builds two throwaway modules via orchestrator_module(), each of which compile()s and exec()s the entire orchestrator source. It is called by four tests, so a full run performs 4 file reads, 8 compiles and 8 module executions of the largest file in the repo. The 'clean' module is byte-identical across all four calls and could be built once per class (setUpClass) and reused, since each test only needs its own mutant; the mutation targets also differ only in one call, so only 2 distinct mutated sources exist. This is per-test work inside a loop over tests that could be hoisted. Cost is test-suite time only, not production, and it is bounded and deterministic, so it does not block.",
+          "file": "test_utf8_io.py",
+          "line": 675,
+          "acceptance_criteria": [
+            "AC-3"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "Two audit tests bypass the new per-path parse cache and re-read/re-parse the scoped files",
+          "detail": "text_io_calls() was given _CALL_CACHE specifically because the same four sources (one ~4000 lines) were parsed repeatedly. test_every_encoding_is_utf8 (line 327) and test_low_level_os_open_is_not_given_an_encoding (line 356) each call path.read_text() plus ast.parse() directly, duplicating the walk logic in calls_in_source rather than reusing the cached result. That reintroduces two full reads+parses of orchestrator.py per run and means the cache's benefit is partial. AuditCacheTests.test_repeated_path_audits_parse_once proves the cached path parses once, but does not cover these two call sites.",
+          "file": "test_utf8_io.py",
+          "line": 327,
+          "acceptance_criteria": [
+            "AC-4"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "run_hook spawns a Python subprocess per test with no timeout",
+          "detail": "HookCase.run_hook calls subprocess.run([...]) with capture_output and no timeout= argument. It is the driver for roughly a dozen tests across StopGuardFailsClosedTests, SessionStartEmitsUtf8Tests and SessionStartDegradesLoudlyTests, all of which run under AC-1 and AC-2 and in CI. If a hook ever fails to terminate, the run blocks indefinitely rather than failing; input=b'' closes stdin, which makes the common stdin-hang case unlikely, so this is a resilience gap rather than an observed stall. Every subprocess invocation in .ai/scripts/orchestrator.py carries an explicit *_TIMEOUT_S, so the repo convention is otherwise consistent.",
+          "file": "test_hook_resilience.py",
+          "line": 91,
+          "acceptance_criteria": [
+            "AC-1",
+            "AC-2"
+          ]
+        }
+      ],
+      "checked": [
+        "test_utf8_io.py in full: the new _CALL_CACHE path cache in text_io_calls, calls_in_source split, is_binary_mode positional scan, the AuditDiscriminatesTests mutation harness (orchestrator_module / omitted_encoding_is_utf16 / run_round_trip), AuditCacheTests parse-count regressions, Python39CompatibilityTests",
+        "test_hook_resilience.py in full: the HookCase subprocess harness (run_hook), the fixture writers, StopGuardFailsClosedTests, SessionStartEmitsUtf8Tests (including the new no-buffer emit test), SessionStartDegradesLoudlyTests, HookExitCodeContractTests source reads",
+        "./.ai/hooks/session_start.py: read_or_warn, emit (encode + buffer write + text fallback), blocks(), main() string assembly",
+        "./.ai/hooks/stop_guard.py: read_guarded, context_blocks, main() control flow and per-run file reads",
+        "Plan v5 acceptance criteria AC-1..AC-6 and their verify commands, for what work each test run implies"
+      ]
+    }
+  },
+  "summary": {
+    "dimensions_ran": [
+      "correctness",
+      "performance",
+      "security"
+    ],
+    "dimensions_failed": {}
+  }
+}
