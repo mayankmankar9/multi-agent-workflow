@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#
+# Hook launcher: find an interpreter that actually runs, then exec the hook.
+#
+# Registering hooks as `python .ai/hooks/x.py` looked fine and silently did
+# nothing. On Windows `python` and `python3` are App Execution Alias stubs that
+# print "Python was not found" and exit 9009; on most Linux images `python` does
+# not exist at all. Either way the hook failed, and because only exit code 2
+# blocks, the failure was invisible: the context-bus injection never ran and the
+# Stop write-back guard never enforced anything. Guards that fail open are worse
+# than no guards, because they read as enforcement.
+#
+# Observed, not assumed: Claude Code runs hook commands under bash on both
+# Windows (MINGW64) and Linux, so one POSIX launcher covers both. The stubs are
+# on PATH ahead of the real interpreter inside that shell, so a name is not
+# enough -- each candidate is executed before it is trusted.
+#
+# ORCHESTRATOR_PYTHON is exported by the orchestrator's worker_env() and is the
+# interpreter already running the workflow, so it is tried first and is the only
+# candidate guaranteed to be the right one.
+#
+# Usage: bash .ai/hooks/run <hook-script.py>
+
+set -u
+
+script="${1:-}"
+
+if [ -z "$script" ]; then
+    echo "hooks/run: no hook script given" >&2
+    exit 2
+fi
+
+shift
+
+# A candidate is only accepted if it runs. `-c pass` is the cheapest possible
+# proof, and it is what separates a real interpreter from a Store stub.
+usable() {
+    [ -n "${1:-}" ] && "$1" -c pass >/dev/null 2>&1
+}
+
+interpreter=""
+
+for candidate in "${ORCHESTRATOR_PYTHON:-}" python3 python py; do
+    if usable "$candidate"; then
+        interpreter="$candidate"
+        break
+    fi
+done
+
+if [ -z "$interpreter" ]; then
+    # Exit 2 so this is loud. An environment with no working interpreter cannot
+    # run this workflow at all -- the orchestrator is itself Python -- so
+    # failing at the first hook is the earliest honest place to say so.
+    echo "hooks/run: no working Python interpreter found for $script" >&2
+    echo "hooks/run: tried ORCHESTRATOR_PYTHON, python3, python, py" >&2
+    exit 2
+fi
+
+exec "$interpreter" "$script" "$@"

@@ -39,6 +39,12 @@
       "type": "integer",
       "minimum": 1
     },
+    "plan_file": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "branch": {
       "type": [
         "string",
@@ -52,6 +58,20 @@
       ]
     },
     "failure_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "baseline_file": {
+      "description": "Immutable pre-implementation snapshot of the working tree, captured once at the implement gate. Never re-captured on a replan: work the task already did would otherwise be relabelled as pre-existing.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "baseline_sha256": {
+      "description": "Digest of the baseline's content, also recorded in the BASELINE_CAPTURED event. Both must agree or validation fails closed.",
       "type": [
         "string",
         "null"

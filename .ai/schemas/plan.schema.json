@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Implementation Plan",
+  "description": "The implementation contract produced by the planning worker. Passed to codex exec via --output-schema and re-validated by the orchestrator, which never trusts the flag alone.",
+  "type": "object",
+  "required": [
+    "objective",
+    "requirements",
+    "files_to_modify",
+    "files_to_create",
+    "acceptance_criteria",
+    "constraints",
+    "risks",
+    "open_questions",
+    "test_strategy"
+  ],
+  "properties": {
+    "objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "files_to_modify": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/fileEntry"
+      }
+    },
+    "files_to_create": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/fileEntry"
+      }
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/acceptanceCriterion"
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "test_strategy": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "fileEntry": {
+      "type": "object",
+      "required": [
+        "path",
+        "purpose"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "purpose": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "acceptanceCriterion": {
+      "description": "A criterion plus how it is verified. verify is a shell command run by the validate step, or the literal \"judge\" to route the statement to a reviewer agent (not yet implemented; treated as unverified). Every property is listed in required because this schema is passed to the planner as a structured-output schema, which rejects an optional property outright; the orchestrator's own validator treats depends_on and material as optional so that plans written before they existed still parse.",
+      "type": "object",
+      "required": [
+        "id",
+        "statement",
+        "verify",
+        "depends_on",
+        "material"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^AC-[0-9]+$"
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 1
+        },
+        "verify": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Shell command that exits 0 when the criterion holds. Use the literal token {python} to invoke Python; the orchestrator expands it to the interpreter it is running on. Bare 'python' or 'python3' is an App Execution Alias stub on Windows that exits 9009 without running, so a criterion written that way fails regardless of the code. {python} is the only interpreter a criterion can reach: never invoke a second version ('py -3.9', 'python3.12'), because multi-version coverage belongs to the CI matrix and a missing interpreter is recorded as a failed criterion rather than an unrun one. Prefer a named test selector over 'unittest discover', which exits 0 on an empty suite."
+        },
+        "depends_on": {
+          "description": "Repo-relative paths this criterion is evidence about. Emit [] to fall back to the plan's whole declared file set. The criterion counts as passed only if at least one of these changed since the task baseline: a command that exits 0 against files this task never touched shows the artifact was already there, not that the task produced it.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "material": {
+          "description": "Whether passing this criterion is meant to demonstrate work this task produced. Emit true for a normal criterion. Emit false only for a deliberate regression guard ('the existing suite still passes'), which is then recorded as a guard rather than as proof of new work. It lives in the plan's bytes, so the developer approves it.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

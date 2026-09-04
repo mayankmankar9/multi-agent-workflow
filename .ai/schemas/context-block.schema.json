@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Context Block",
+  "description": "One append-only entry on a task's shared blackboard. Agents coordinate by reading and writing this structured space rather than by direct message passing, so what one worker learned is available to the next.",
+  "type": "object",
+  "required": [
+    "block_id",
+    "author",
+    "phase",
+    "type",
+    "timestamp",
+    "content"
+  ],
+  "properties": {
+    "block_id": {
+      "type": "string",
+      "pattern": "^ctx-[0-9]+$"
+    },
+    "author": {
+      "description": "Who wrote it. 'orchestrator' for deterministic records.",
+      "type": "string",
+      "minLength": 1
+    },
+    "phase": {
+      "description": "The task status when the block was written.",
+      "type": "string",
+      "minLength": 1
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "repo_finding",
+        "decision",
+        "constraint_discovered",
+        "deviation",
+        "failure_observation",
+        "open_question",
+        "resolved_question"
+      ]
+    },
+    "timestamp": {
+      "type": "string"
+    },
+    "content": {
+      "type": "string",
+      "minLength": 1
+    },
+    "confidence": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "high",
+        "medium",
+        "low",
+        null
+      ]
+    },
+    "evidence": {
+      "description": "Commands run or files read that support the content. A block with no evidence is a claim, not a finding.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}

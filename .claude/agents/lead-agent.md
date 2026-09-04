@@ -64,7 +64,7 @@ Every task has a persistent workspace:
 At minimum maintain:
 
 - requirement.md
-- plan.yaml
+- plan.json
 - state.json
 
 Add implementation and validation artifacts as the task progresses.
