@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Iterator, List, Optional, Tuple
 
 # Subprocess wall-clock ceilings. A hung worker must fail the task rather than
@@ -563,6 +563,30 @@ def resolve_bash() -> str:
     return shutil.which("bash") or "bash"
 
 
+def worker_name(argv0: str) -> str:
+    """Reduce a worker's argv[0] to the plain name to record it under.
+
+    events.jsonl has to stay comparable across machines where the CLI lives
+    somewhere different, so usage is recorded under the plain name and never
+    the resolved path. argv[0] may arrive already resolved -- claude_argv
+    resolves eagerly so run_structured_agent can exec it directly -- so the
+    name is recovered rather than assumed to be bare. Without this the ledger
+    recorded `worker: C:\\...\\npm\\claude.CMD`, which no `cost` report could
+    group with a POSIX run of the same worker.
+
+    The flavour is pinned to ``PureWindowsPath`` rather than ``Path``, because
+    ``Path`` is whatever the *host* is: on Linux it is a PurePosixPath, which
+    does not treat ``\\`` as a separator and so reduced a Windows-resolved
+    `claude.CMD` path to the entire string -- reintroducing on POSIX the exact
+    ungroupable ledger entry this exists to prevent. PureWindowsPath accepts
+    both separators on every platform, so a Windows path and a POSIX path
+    reduce identically wherever this runs. That also makes the behaviour
+    testable off-Windows: a host-dependent flavour passes its own tests on the
+    host that cannot detect the bug.
+    """
+    return PureWindowsPath(argv0).stem or argv0
+
+
 def run_worker(
     argv: List[str],
     timeout: int,
@@ -585,14 +609,7 @@ def run_worker(
     from the same directory, so the hooks the worker triggers cannot disagree
     with the worker about where it is running.
     """
-    # Record usage under the plain name, never the resolved path: events.jsonl
-    # has to stay comparable across machines where the CLI lives somewhere
-    # different. argv[0] may arrive already resolved -- claude_argv resolves
-    # eagerly so run_structured_agent can exec it directly -- so the name is
-    # recovered from the stem rather than assumed to be bare. Without this the
-    # ledger recorded `worker: C:\...\npm\claude.CMD`, which no `cost` report
-    # could group with a POSIX run of the same worker.
-    worker = Path(argv[0]).stem or argv[0]
+    worker = worker_name(argv[0])
     started = time.monotonic()
     stdout = None
 

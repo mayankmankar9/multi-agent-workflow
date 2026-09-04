@@ -126,6 +126,34 @@ class RunWorkerResolutionTests(TaskDirCase):
 
         self.assertEqual(usage[0]["worker"], "codex")
 
+    def test_worker_name_is_host_independent(self):
+        """The two tests above pass on the host that cannot detect the bug.
+
+        `run_worker` originally reduced argv[0] with `Path(...).stem`, and
+        `Path` is whatever the host is. On Windows that handles both
+        separators, so a Windows path and a POSIX path both reduced correctly
+        and the pair above went green -- while on Linux `Path` is a
+        PurePosixPath that does not split on `\\`, so the same code recorded
+        `worker: C:\\Users\\...\\npm\\claude` and CI failed on a tree that had
+        passed local validation.
+
+        So the obligation is asserted directly on the reduction, over both
+        separator styles at once. This fails on every platform if the flavour
+        goes back to being the host's.
+        """
+        cases = [
+            (r"C:\Users\x\AppData\Roaming\npm\claude.CMD", "claude"),
+            (r"C:\npm\codex.CMD", "codex"),
+            ("/usr/local/bin/codex", "codex"),
+            ("/home/runner/.npm-global/bin/claude", "claude"),
+            ("claude", "claude"),
+            ("codex", "codex"),
+        ]
+
+        for argv0, expected in cases:
+            with self.subTest(argv0=argv0):
+                self.assertEqual(orch.worker_name(argv0), expected)
+
     def test_missing_worker_is_reported_by_name_not_by_path(self):
         with mock.patch.object(
             orch.subprocess, "run", side_effect=FileNotFoundError()
