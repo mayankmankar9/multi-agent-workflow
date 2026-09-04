@@ -524,10 +524,10 @@ index 0000000..b2abb9d
 +    raise SystemExit(main())
 diff --git a/.ai/hooks/pre_tool_use.py b/.ai/hooks/pre_tool_use.py
 new file mode 100644
-index 0000000..b7d603c
+index 0000000..6f348f5
 --- /dev/null
 +++ b/.ai/hooks/pre_tool_use.py
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,404 @@
 +#!/usr/bin/env python3
 +"""
 +PreToolUse hook: hard-deny what CLAUDE.md only asks for.
@@ -546,13 +546,22 @@ index 0000000..b7d603c
 +Two tiers, because they answer different questions:
 +
 +*Evidence* -- state.json, events.jsonl, baseline.json, test-results.json,
-+validation.md, review-findings.json -- is never writable by a worker. No plan
-+can authorise a worker to write its own results; that is forging, and a plan
-+that asked for it would be the clearest possible sign something had gone wrong.
-+baseline.json belongs in this tier for a specific reason: it is the record of
-+what the tree looked like before the worker ran, so a worker able to edit it
-+could make its own output look pre-existing, or make pre-existing files look
-+like work it did.
++validation.md, review-findings.json, critique-<plan-stem>-round-<round>.json --
++is never writable by a worker. No plan can authorise a worker to write its own
++results; that is forging, and a plan that asked for it would be the clearest
++possible sign something had gone wrong. baseline.json belongs in this tier for
++a specific reason: it is the record of what the tree looked like before the
++worker ran, so a worker able to edit it could make its own output look
++pre-existing, or make pre-existing files look like work it did. The critique
++artifacts belong here for the mirror-image reason: they are a read-only
++checker's verdict on a plan, and a worker able to author one could hand the
++developer a critique nothing criticised.
++
++This hook is registered as a cwd-relative command, so the copy that executes
++belongs to the worker's cwd -- its recorded worktree, once worker execution is
++rooted there. The approved plan and the task's evidence it authorises against
++live in the orchestrator checkout, which arrives as an absolute path from
++``worker_env()``; cwd remains the fallback outside an orchestrated run.
 +
 +*Infrastructure* -- .ai/scripts/, .ai/schemas/, .ai/hooks/, settings.json -- is
 +denied unless the approved plan declares the file. This repository's only source
@@ -583,6 +592,11 @@ index 0000000..b7d603c
 +    r"\.ai/tasks/[^/]+/test-results\.json$",
 +    r"\.ai/tasks/[^/]+/validation\.md$",
 +    r"\.ai/tasks/[^/]+/review-findings\.json$",
++    # The whole naming family, not one example of it: a guard matching only
++    # `critique-plan-round-1.json` would leave `critique-plan-v4-round-2.json`
++    # forgeable, which is the artifact the developer actually reads at the
++    # approval gate.
++    r"\.ai/tasks/[^/]+/critique-[^/]+-round-[0-9]+\.json$",
 +)
 +
 +# Workflow infrastructure. Denied to a worker unless the approved plan declares
@@ -599,7 +613,38 @@ index 0000000..b7d603c
 +# Git subcommands that publish or rewrite history.
 +FORBIDDEN_GIT = {"commit", "push", "reset", "rebase", "tag"}
 +
-+TASKS = Path(".ai") / "tasks"
++TASKS_RELATIVE = Path(".ai") / "tasks"
++
++
++def exported_dir(name):
++    """An absolute directory the orchestrator exported, if it is usable."""
++    raw = (os.environ.get(name) or "").strip()
++
++    if not raw:
++        return None
++
++    candidate = Path(raw)
++
++    return candidate if candidate.is_dir() else None
++
++
++def repo_root():
++    """The orchestrator checkout: where the approved plan and evidence live."""
++    return exported_dir("ORCHESTRATOR_REPO_ROOT") or Path.cwd()
++
++
++def worker_root():
++    """The tree the worker is writing into: its worktree, or the checkout."""
++    return exported_dir("ORCHESTRATOR_WORKER_ROOT") or Path.cwd()
++
++
++def task_directory():
++    raw = (os.environ.get("ORCHESTRATOR_TASK_DIR") or "").strip()
++
++    if raw:
++        return Path(raw)
++
++    return repo_root() / TASKS_RELATIVE / task_id()
 +
 +
 +def worker_session():
@@ -644,18 +689,36 @@ index 0000000..b7d603c
 +
 +
 +def relative_to_repo(path):
-+    """Express an absolute path relative to the repo, for plan comparison.
++    """Candidate repo-relative forms of a path, for plan comparison.
 +
 +    Agents pass absolute paths as often as relative ones. Comparing raw strings
 +    would let the same file be denied one way and allowed the other.
++
++    Two roots are tried, because a worker rooted in a recorded worktree writes
++    paths under that tree while the plan declares them relative to the
++    repository. Both resolve to the same declared path, and a guard that knew
++    only one of them would deny a write the developer had approved.
 +    """
 +    candidate = normalise(path)
++    forms = [candidate]
 +
 +    try:
-+        resolved = Path(candidate).resolve()
-+        return resolved.relative_to(Path.cwd().resolve()).as_posix()
-+    except (ValueError, OSError):
-+        return candidate
++        resolved = Path(candidate)
++
++        if not resolved.is_absolute():
++            resolved = worker_root() / resolved
++
++        resolved = resolved.resolve()
++    except OSError:
++        return forms
++
++    for root in (worker_root(), repo_root()):
++        try:
++            forms.append(resolved.relative_to(root.resolve()).as_posix())
++        except (ValueError, OSError):
++            continue
++
++    return forms
 +
 +
 +def approved_plan():
@@ -667,7 +730,7 @@ index 0000000..b7d603c
 +    the same rule verify_approval() applies before the implementer is invoked,
 +    enforced again at the point the write actually happens.
 +    """
-+    directory = TASKS / task_id()
++    directory = task_directory()
 +
 +    try:
 +        state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
@@ -679,10 +742,13 @@ index 0000000..b7d603c
 +
 +    if not plan_path.is_absolute():
 +        # plan_file is recorded as a repo-relative path in some states and a
-+        # bare filename in others.
++        # bare filename in others. Resolved against the orchestrator checkout,
++        # never the worker's cwd: the plan the developer approved is the one in
++        # the checkout, and a worktree copy of it would authorise its own bytes.
++        candidate = repo_root() / plan_name
 +        plan_path = (
-+            Path(plan_name)
-+            if Path(plan_name).is_file()
++            candidate
++            if candidate.is_file()
 +            else directory / Path(plan_name).name
 +        )
 +
@@ -759,18 +825,20 @@ index 0000000..b7d603c
 +        if not target:
 +            continue
 +
-+        if matches(target, PROTECTED_EVIDENCE_PATTERNS):
++        forms = relative_to_repo(target)
++
++        if any(matches(form, PROTECTED_EVIDENCE_PATTERNS) for form in forms):
 +            return deny(
 +                "Denied: %s is orchestrator-owned evidence. The orchestrator "
-+                "writes task state and validation results; a worker writing "
-+                "them would be forging evidence. No plan can authorise this."
-+                % target
++                "writes task state, validation results and plan critiques; a "
++                "worker writing them would be forging evidence. No plan can "
++                "authorise this." % target
 +            )
 +
-+        if matches(target, PROTECTED_INFRA_PATTERNS):
++        if any(matches(form, PROTECTED_INFRA_PATTERNS) for form in forms):
 +            declared = declared_files()
 +
-+            if relative_to_repo(target) in declared or normalise(target) in declared:
++            if any(form in declared for form in forms):
 +                continue
 +
 +            return deny(
@@ -931,10 +999,10 @@ index 0000000..b862aec
 +exec "$interpreter" "$script" "$@"
 diff --git a/.ai/hooks/session_start.py b/.ai/hooks/session_start.py
 new file mode 100644
-index 0000000..708c633
+index 0000000..a9712d7
 --- /dev/null
 +++ b/.ai/hooks/session_start.py
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,138 @@
 +#!/usr/bin/env python3
 +"""SessionStart hook: inject the task blackboard into the agent's context.
 +
@@ -947,6 +1015,15 @@ index 0000000..708c633
 +when it invokes a worker. With no task id there is nothing to inject, and the
 +hook exits quietly: a hook that fails noisily outside the workflow would make
 +the repo unusable for ordinary sessions.
++
++``.claude/settings.json`` registers this as a cwd-relative command, so the copy
++that executes is the one in the worker's cwd -- its recorded worktree, once
++worker execution is rooted there. That copy is the code that runs, and it must
++still read the *orchestrator checkout's* blackboard: evidence is single-homed,
++and a worktree copy resolving ``.ai/tasks/<id>`` against its own cwd would
++inject a different, empty one. So the authoritative locations arrive as
++absolute paths from ``worker_env()``, with cwd kept as the fallback for a
++session the orchestrator did not launch.
 +"""
 +
 +import json
@@ -955,11 +1032,46 @@ index 0000000..708c633
 +from pathlib import Path
 +
 +CONTEXT_FILENAME = "context.jsonl"
-+CONSTITUTION = Path(".ai") / "constitution.md"
++CONSTITUTION_RELATIVE = Path(".ai") / "constitution.md"
++
++
++def exported_dir(name):
++    """An absolute directory the orchestrator exported, if it is usable."""
++    raw = (os.environ.get(name) or "").strip()
++
++    if not raw:
++        return None
++
++    candidate = Path(raw)
++
++    return candidate if candidate.is_dir() else None
++
++
++def repo_root():
++    """The orchestrator checkout, where task evidence is single-homed."""
++    return exported_dir("ORCHESTRATOR_REPO_ROOT") or Path.cwd()
++
++
++def task_directory(task_id):
++    raw = (os.environ.get("ORCHESTRATOR_TASK_DIR") or "").strip()
++
++    if raw:
++        return Path(raw)
++
++    return repo_root() / ".ai" / "tasks" / task_id
++
++
++def constitution_path():
++    raw = (os.environ.get("ORCHESTRATOR_CONSTITUTION") or "").strip()
++
++    if raw:
++        return Path(raw)
++
++    return repo_root() / CONSTITUTION_RELATIVE
 +
 +
 +def blocks(task_id):
-+    path = Path(".ai") / "tasks" / task_id / CONTEXT_FILENAME
++    path = task_directory(task_id) / CONTEXT_FILENAME
 +
 +    if not path.is_file():
 +        return []
@@ -985,12 +1097,16 @@ index 0000000..708c633
 +        return 0
 +
 +    parts = []
++    constitution = constitution_path()
 +
-+    if CONSTITUTION.is_file():
-+        text = CONSTITUTION.read_text(encoding="utf-8").strip()
++    if constitution.is_file():
++        text = constitution.read_text(encoding="utf-8").strip()
 +
 +        if text:
-+            parts.append("Project invariants (%s):\n\n%s" % (CONSTITUTION, text))
++            parts.append(
++                "Project invariants (%s):\n\n%s"
++                % (CONSTITUTION_RELATIVE, text)
++            )
 +
 +    found = blocks(task_id)
 +
@@ -1027,10 +1143,10 @@ index 0000000..708c633
 +    raise SystemExit(main())
 diff --git a/.ai/hooks/stop_guard.py b/.ai/hooks/stop_guard.py
 new file mode 100644
-index 0000000..4628a4c
+index 0000000..c3ce454
 --- /dev/null
 +++ b/.ai/hooks/stop_guard.py
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,123 @@
 +#!/usr/bin/env python3
 +"""Stop hook: refuse to end a worker session that wrote nothing back.
 +
@@ -1045,6 +1161,14 @@ index 0000000..4628a4c
 +
 +**Exit code 2 is the only code that blocks.** Exit 1 blocks nothing -- it is the
 +single most common hooks bug, so this script never uses it for a refusal.
++
++Registered as a cwd-relative command, so the copy that runs belongs to the
++worker's cwd -- its recorded worktree, once worker execution is rooted there.
++The evidence it checks is not in that copy's tree: ``implementation.md`` and
++the blackboard live in the orchestrator checkout, and a guard resolving them
++against the worker's cwd would check an empty directory and pass everything.
++The authoritative location arrives as an absolute path from ``worker_env()``,
++with cwd kept as the fallback outside an orchestrated run.
 +"""
 +
 +import json
@@ -1058,8 +1182,27 @@ index 0000000..4628a4c
 +ALLOW = 0
 +
 +
++def repo_root():
++    """The orchestrator checkout, where task evidence is single-homed."""
++    raw = (os.environ.get("ORCHESTRATOR_REPO_ROOT") or "").strip()
++
++    if raw and Path(raw).is_dir():
++        return Path(raw)
++
++    return Path.cwd()
++
++
++def task_directory(task_id):
++    raw = (os.environ.get("ORCHESTRATOR_TASK_DIR") or "").strip()
++
++    if raw:
++        return Path(raw)
++
++    return repo_root() / ".ai" / "tasks" / task_id
++
++
 +def context_blocks(task_id):
-+    path = Path(".ai") / "tasks" / task_id / CONTEXT_FILENAME
++    path = task_directory(task_id) / CONTEXT_FILENAME
 +
 +    if not path.is_file():
 +        return []
@@ -1088,7 +1231,7 @@ index 0000000..4628a4c
 +    if os.environ.get("ORCHESTRATOR_SKIP_STOP_GUARD") == "1":
 +        return ALLOW
 +
-+    task_dir = Path(".ai") / "tasks" / task_id
++    task_dir = task_directory(task_id)
 +    problems = []
 +
 +    notes = task_dir / "implementation.md"
@@ -1462,10 +1605,10 @@ index dfc42e9..8cd520c 100644
    },
    "additionalProperties": false
 diff --git a/.ai/scripts/orchestrator.py b/.ai/scripts/orchestrator.py
-index 02eecc4..4268cc7 100755
+index 02eecc4..9858134 100755
 --- a/.ai/scripts/orchestrator.py
 +++ b/.ai/scripts/orchestrator.py
-@@ -1,11 +1,139 @@
+@@ -1,11 +1,155 @@
 -\
  #!/usr/bin/env python3
  
@@ -1481,7 +1624,8 @@ index 02eecc4..4268cc7 100755
 +import tempfile
 +import time
  from datetime import datetime
- from pathlib import Path
+-from pathlib import Path
++from pathlib import Path, PureWindowsPath
 +from typing import Iterator, List, Optional, Tuple
 +
 +# Subprocess wall-clock ceilings. A hung worker must fail the task rather than
@@ -1526,6 +1670,17 @@ index 02eecc4..4268cc7 100755
 +# A plan critic verdict below this bounces the plan back to the planner.
 +CRITIC_MAX_ROUNDS = 2
 +
++# Where a critique round's issue text is persisted. The critique used to be
++# *counted* -- record_event(..., issues=len(...), blocking=len(...)) -- and the
++# text went to stdout and nowhere else. Yet on exhausting its rounds the
++# orchestrator told the developer to read a critique before approving. Two
++# blocking issues existed and there was no way to read them; TASK-008's own
++# plan v1 critique had to be recovered from a transient 524 KB log.
++#
++# The name carries both the plan it judged and the round that produced it, so
++# a stale artifact cannot be mistaken for the one shown at the approval gate.
++CRITIQUE_FILENAME_TEMPLATE = "critique-%s-round-%d.json"
++
 +# Per-task shared blackboard. Line-delimited so it is genuinely append-only,
 +# like events.jsonl -- a JSON array cannot be appended without a rewrite.
 +CONTEXT_FILENAME = "context.jsonl"
@@ -1557,6 +1712,11 @@ index 02eecc4..4268cc7 100755
 +    ".ai/tasks/",
 +    ".ai/scripts/__pycache__/",
 +)
++
++# A task in one of these no longer owns anything structurally: its worktree and
++# its task directory are ordinary tree contents again, so a change under them
++# is this task's to answer for.
++FOREIGN_OWNER_TERMINAL_STATES = {"COMPLETED"}
 +
 +# Immutable snapshot of the working tree, taken once at the implement gate.
 +# Without it, validation can only see what exists now -- so a criterion whose
@@ -1606,7 +1766,31 @@ index 02eecc4..4268cc7 100755
  
  VALID_NEXT_STATES = {
      "NEW": "ANALYZING",
-@@ -35,467 +163,4010 @@ def load_state(task_id: str) -> tuple[Path, dict]:
+@@ -20,6 +164,23 @@ VALID_NEXT_STATES = {
+ 
+ PROTECTED_BRANCHES = {"main", "master"}
+ 
++# Events that end an implementation attempt. An attempt with one of these after
++# its IMPLEMENTATION_STARTED was not interrupted, so `recover` refuses it.
++# Enumerated rather than inferred: a missing entry here would let recovery
++# accept a task whose outcome was already recorded.
++IMPLEMENTATION_TERMINATING_EVENTS = (
++    "IMPLEMENTATION_FAILED",
++    "VALIDATION_STARTED",
++    "VALIDATION",
++    "TASK_RECOVERED",
++)
++
++# Who asserts a recovery, and who asserts that a leftover lock is stale. Both
++# are human assertions and are recorded as such: the second is the only thing
++# that authorises recovery past a lock, because no liveness probe can.
++RECOVER_ASSERTER_ENV = "ORCHESTRATOR_RECOVERED_BY"
++RECOVER_LOCK_OVERRIDE_ENV = "ORCHESTRATOR_RECOVER_LOCK_OVERRIDE"
++
+ 
+ def now() -> str:
+     return datetime.now().astimezone().isoformat()
+@@ -35,458 +196,4376 @@ def load_state(task_id: str) -> tuple[Path, dict]:
      if not path.is_file():
          raise FileNotFoundError(f"Task state not found: {path}")
  
@@ -1691,14 +1875,143 @@ index 02eecc4..4268cc7 100755
 +    try:
 +        with os.fdopen(fd, "w", encoding="utf-8") as f:
 +            f.write(f"pid={os.getpid()} at={now()}\n")
-+
+ 
+-    if not events_file.is_file():
+-        return False
 +        yield lock_path
 +    finally:
 +        with contextlib.suppress(OSError):
 +            lock_path.unlink()
+ 
+-    with events_file.open() as f:
+-        return any(
+-            json.loads(line).get("event") == event
+-            for line in f
+-            if line.strip()
+-        )
+ 
++def repo_root() -> Path:
++    """The orchestrator checkout: where task evidence is single-homed.
+ 
+-def current_branch() -> str:
+-    result = subprocess.run(
+-        ["git", "branch", "--show-current"],
+-        cwd=Path.cwd(),
+-        capture_output=True,
+-        text=True,
+-        check=True,
+-    )
+-    return result.stdout.strip()
++    The orchestrator always runs from here, so ``Path.cwd()`` is the answer.
++    It has a name because a worker's cwd is no longer the same directory: once
++    execution is rooted in a task's recorded worktree, "where the source is"
++    and "where the evidence is" are two different places, and code that means
++    the second must say so.
++    """
++    return Path.cwd()
+ 
+ 
+-def verify_implementation_branch(task_id: str, state: dict) -> None:
+-    branch = current_branch()
++def recorded_worktree(state: Optional[dict]) -> Optional[Path]:
++    """A task's recorded worktree as an absolute directory, when usable.
+ 
+-    if branch in PROTECTED_BRANCHES:
+-        raise RuntimeError(
+-            f"Refusing implementation on protected branch: {branch}"
+-        )
++    Returns None for a legacy task whose ``worktree`` is null -- every task
++    that predates this -- and also for a recorded path that is not a directory
++    now. A stale record must fall back to the orchestrator checkout rather
++    than root a subprocess at something that is not there; ``run_worktree``
++    records a repo-relative path, so a bare name is resolved against the
++    checkout rather than the caller's cwd.
++    """
++    if not isinstance(state, dict):
++        return None
+ 
+-    expected = state.get("branch")
++    raw = state.get("worktree")
+ 
+-    if expected and branch != expected:
+-        raise RuntimeError(
+-            f"Branch mismatch: state says {expected}, "
+-            f"repository is on {branch}"
+-        )
++    if not isinstance(raw, str) or not raw.strip():
++        return None
+ 
+-    if not branch:
+-        raise RuntimeError("Refusing implementation with detached HEAD.")
++    candidate = Path(raw.strip())
+ 
++    if not candidate.is_absolute():
++        candidate = repo_root() / candidate
+ 
+-def run_codex_planning(task_id: str) -> None:
+-    repo_root = Path.cwd()
+-    directory = task_dir(task_id)
+-    requirement_file = directory / "requirement.md"
+-    plan_file = directory / "plan.yaml"
++    try:
++        resolved = candidate.resolve()
++    except OSError:
++        return None
++
++    return resolved if resolved.is_dir() else None
 +
 +
-+def worker_env(task_id: Optional[str]) -> Optional[dict]:
++def execution_root(task_id: Optional[str], state: Optional[dict] = None) -> Path:
++    """Where a task's workers, acceptance commands and manifests run.
++
++    ``run_worktree`` created a tree, recorded it in ``state["worktree"]`` and
++    nothing ever read it as a working directory: every subprocess ran in
++    ``Path.cwd()``, so the stated purpose -- letting tasks run in parallel
++    without fighting over one checkout -- was not delivered. This is what makes
++    the record mean something.
++
++    State is loaded when not supplied, and a task with no readable state is not
++    an error here: ``worker_env`` is called for task ids that have no workspace
++    yet, and the honest answer for those is the orchestrator checkout.
++    """
++    if state is None and task_id:
++        try:
++            _, state = load_state(task_id)
++        except (FileNotFoundError, OSError, ValueError):
++            state = None
++
++    return recorded_worktree(state) or repo_root()
++
++
++def authoritative_path(path) -> Path:
++    """Name a repo-relative path the way a worker must see it.
++
++    ``task_dir`` and everything derived from it are relative, which is correct
++    for the orchestrator's own reads -- it runs from the checkout -- and wrong
++    for anything handed to a worker: a worker's cwd is its recorded worktree,
++    and ``.ai/tasks/`` is tracked in git, so the same relative string names a
++    *committed, possibly stale* copy of the requirement, the plan and the notes
++    over there. A worker told to read the plan relatively can therefore
++    implement bytes other than the ones the developer's hash-bound approval
++    covers, and its ``implementation.md`` lands where the Stop guard -- which
++    reads the exported absolute path -- does not look.
++
++    An absolute path is returned unchanged so a caller that already resolved
++    one (``state["plan_file"]`` may be recorded either way) is not re-rooted.
++    """
++    candidate = Path(path)
++
++    return candidate if candidate.is_absolute() else repo_root().resolve() / candidate
++
++
++def evidence_dir(task_id: str) -> Path:
++    """A task's evidence directory, single-homed in the orchestrator checkout."""
++    return authoritative_path(task_dir(task_id))
++
++
++def worker_env(
++    task_id: Optional[str], root: Optional[Path] = None
++) -> Optional[dict]:
 +    """Environment for a worker subprocess.
 +
 +    Exports the task id so lifecycle hooks can find the blackboard and know
@@ -1708,11 +2021,21 @@ index 02eecc4..4268cc7 100755
 +    Execution Alias stubs on Windows and are frequently absent on Linux,
 +    whereas this process is by definition running on a working interpreter.
 +
++    It also exports where the *evidence* lives. ``.claude/settings.json``
++    registers hooks as cwd-relative commands, so a worker rooted in its
++    recorded worktree executes that worktree's copy of each hook -- and a copy
++    resolving ``.ai/tasks/<id>`` against its own cwd would read a different,
++    empty blackboard, check the Stop guard against the wrong notes, and
++    authorise writes against the wrong plan. The worktree copy is the code that
++    runs; these absolute roots are the evidence it must run against.
++
 +    Returns None when there is no task, so the child simply inherits the
 +    environment.
 +    """
 +    if not task_id:
 +        return None
++
++    checkout = repo_root().resolve()
 +
 +    env = dict(os.environ)
 +    env["ORCHESTRATOR_TASK_ID"] = task_id
@@ -1722,6 +2045,12 @@ index 02eecc4..4268cc7 100755
 +    # which worked, and so hid the fact that the pin was not taking effect.
 +    env["ORCHESTRATOR_PYTHON"] = (
 +        Path(sys.executable).as_posix() if sys.executable else "python3"
++    )
++    env["ORCHESTRATOR_REPO_ROOT"] = str(checkout)
++    env["ORCHESTRATOR_TASK_DIR"] = str(evidence_dir(task_id))
++    env["ORCHESTRATOR_CONSTITUTION"] = str(authoritative_path(CONSTITUTION_PATH))
++    env["ORCHESTRATOR_WORKER_ROOT"] = str(
++        (root or execution_root(task_id)).resolve()
 +    )
 +    return env
 +
@@ -1743,8 +2072,8 @@ index 02eecc4..4268cc7 100755
 +    if not task_id:
 +        return
  
--    if not events_file.is_file():
--        return False
+-    if not requirement_file.is_file():
+-        raise FileNotFoundError(f"Requirement not found: {requirement_file}")
 +    payload = {
 +        "worker": worker,
 +        "duration_s": round(duration_s, 2),
@@ -1755,36 +2084,41 @@ index 02eecc4..4268cc7 100755
 +    payload.update(usage or {})
 +    record_event(task_id, "WORKER_USAGE", **payload)
  
--    with events_file.open() as f:
--        return any(
--            json.loads(line).get("event") == event
--            for line in f
--            if line.strip()
--        )
+-    prompt = f"""You are the planning worker for {task_id}.
  
+-Read the task requirement and inspect the repository.
 +def parse_worker_usage(text: str) -> Optional[dict]:
 +    """Pull usage figures out of a worker's stdout, if it reported any.
  
--def current_branch() -> str:
--    result = subprocess.run(
--        ["git", "branch", "--show-current"],
--        cwd=Path.cwd(),
--        capture_output=True,
--        text=True,
--        check=True,
--    )
--    return result.stdout.strip()
+-Planning only:
+-- Do not modify application source code.
+-- Do not create or delete repository files.
+-- Do not run commands that change repository state.
+-- Produce only valid YAML in your final response.
+-- Do not use markdown code fences.
+-
+-Required top-level fields:
+-objective:
+-requirements:
+-files_to_modify:
+-files_to_create:
+-acceptance_criteria:
+-constraints:
+-risks:
+-open_questions:
+-test_strategy:
 +    Both CLIs can emit a result object carrying ``total_cost_usd`` and a token
 +    breakdown. The shape is not stable across versions and is documented to be
 +    omitted in some modes, so absence is normal and never inferred as zero.
 +    """
 +    payload = extract_json_object(text or "")
  
+-Task requirement:
 +    if payload is None:
 +        return None
  
--def verify_implementation_branch(task_id: str, state: dict) -> None:
--    branch = current_branch()
+-{requirement_file.read_text()}
+-"""
 +    try:
 +        data = json.loads(payload)
 +    except json.JSONDecodeError:
@@ -1808,7 +2142,22 @@ index 02eecc4..4268cc7 100755
 +        ("completion_tokens", "output_tokens"),
 +    ):
 +        value = usage.get(source)
-+
+ 
+-    subprocess.run(
+-        [
+-            "codex",
+-            "exec",
+-            "--sandbox",
+-            "read-only",
+-            "--cd",
+-            str(repo_root),
+-            "--output-last-message",
+-            str(plan_file),
+-            prompt,
+-        ],
+-        cwd=repo_root,
+-        check=True,
+-    )
 +        if isinstance(value, int) and target not in found:
 +            found[target] = value
 +
@@ -1904,12 +2253,37 @@ index 02eecc4..4268cc7 100755
 +    return shutil.which("bash") or "bash"
 +
 +
++def worker_name(argv0: str) -> str:
++    """Reduce a worker's argv[0] to the plain name to record it under.
++
++    events.jsonl has to stay comparable across machines where the CLI lives
++    somewhere different, so usage is recorded under the plain name and never
++    the resolved path. argv[0] may arrive already resolved -- claude_argv
++    resolves eagerly so run_structured_agent can exec it directly -- so the
++    name is recovered rather than assumed to be bare. Without this the ledger
++    recorded `worker: C:\\...\\npm\\claude.CMD`, which no `cost` report could
++    group with a POSIX run of the same worker.
++
++    The flavour is pinned to ``PureWindowsPath`` rather than ``Path``, because
++    ``Path`` is whatever the *host* is: on Linux it is a PurePosixPath, which
++    does not treat ``\\`` as a separator and so reduced a Windows-resolved
++    `claude.CMD` path to the entire string -- reintroducing on POSIX the exact
++    ungroupable ledger entry this exists to prevent. PureWindowsPath accepts
++    both separators on every platform, so a Windows path and a POSIX path
++    reduce identically wherever this runs. That also makes the behaviour
++    testable off-Windows: a host-dependent flavour passes its own tests on the
++    host that cannot detect the bug.
++    """
++    return PureWindowsPath(argv0).stem or argv0
++
++
 +def run_worker(
 +    argv: List[str],
 +    timeout: int,
 +    task_id: Optional[str] = None,
 +    capture: bool = False,
 +    stdin_text: Optional[str] = None,
++    cwd: Optional[Path] = None,
 +) -> Optional[str]:
 +    """Invoke an external worker CLI.
 +
@@ -1919,30 +2293,28 @@ index 02eecc4..4268cc7 100755
 +
 +    ``stdin_text`` delivers a prompt on stdin rather than as a trailing
 +    argument. See ``claude_argv`` for why that is not a stylistic choice.
++
++    ``cwd`` defaults to the task's execution root -- its recorded worktree when
++    it has one, the orchestrator checkout otherwise. The environment is built
++    from the same directory, so the hooks the worker triggers cannot disagree
++    with the worker about where it is running.
 +    """
-+    # Record usage under the plain name, never the resolved path: events.jsonl
-+    # has to stay comparable across machines where the CLI lives somewhere
-+    # different. argv[0] may arrive already resolved -- claude_argv resolves
-+    # eagerly so run_structured_agent can exec it directly -- so the name is
-+    # recovered from the stem rather than assumed to be bare. Without this the
-+    # ledger recorded `worker: C:\...\npm\claude.CMD`, which no `cost` report
-+    # could group with a POSIX run of the same worker.
-+    worker = Path(argv[0]).stem or argv[0]
++    worker = worker_name(argv[0])
 +    started = time.monotonic()
 +    stdout = None
 +
 +    argv = [resolve_executable(argv[0])] + list(argv[1:])
++    root = Path(cwd) if cwd is not None else execution_root(task_id)
  
--    if branch in PROTECTED_BRANCHES:
--        raise RuntimeError(
--            f"Refusing implementation on protected branch: {branch}"
+-    print(f"Codex plan written to: {plan_file}")
+-    record_event(
 +    try:
 +        completed = subprocess.run(
 +            argv,
-+            cwd=Path.cwd(),
++            cwd=str(root),
 +            check=True,
 +            timeout=timeout,
-+            env=worker_env(task_id),
++            env=worker_env(task_id, root),
 +            capture_output=capture,
 +            input=stdin_text,
 +            # text must be on whenever a str crosses the boundary in either
@@ -1955,46 +2327,43 @@ index 02eecc4..4268cc7 100755
 +            encoding=(
 +                "utf-8" if (capture or stdin_text is not None) else None
 +            ),
-         )
--
--    expected = state.get("branch")
--
--    if expected and branch != expected:
++        )
 +        stdout = completed.stdout if capture else None
 +    except FileNotFoundError:
-         raise RuntimeError(
--            f"Branch mismatch: state says {expected}, "
--            f"repository is on {branch}"
++        raise RuntimeError(
 +            f"Worker executable not found on PATH: {worker!r}. "
 +            f"Install it and re-run, or drive this phase manually."
-         )
++        )
 +    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
 +        # Record the cost of a failed run too; a run that burned twenty minutes
 +        # and then failed is exactly the one worth seeing in the ledger.
 +        record_worker_usage(task_id, worker, time.monotonic() - started)
 +        raise
- 
--    if not branch:
--        raise RuntimeError("Refusing implementation with detached HEAD.")
++
 +    record_worker_usage(
-+        task_id,
+         task_id,
+-        "PLAN_CREATED",
+-        plan_version=1,
+-        plan_file=str(plan_file),
+-        worker="codex",
 +        worker,
 +        time.monotonic() - started,
 +        parse_worker_usage(stdout) if capture else None,
-+    )
+     )
 +    return stdout
  
  
--def run_codex_planning(task_id: str) -> None:
--    repo_root = Path.cwd()
--    directory = task_dir(task_id)
--    requirement_file = directory / "requirement.md"
--    plan_file = directory / "plan.yaml"
+-def run_plan(task_id: str) -> int:
+-    state_path, state = load_state(task_id)
 +def extract_json_object(text: str) -> Optional[str]:
 +    """Pull a JSON object out of an agent's response.
  
--    if not requirement_file.is_file():
--        raise FileNotFoundError(f"Requirement not found: {requirement_file}")
+-    if state["status"] != "PLANNING":
+-        print(
+-            f"ERROR: TASK {task_id} is in state {state['status']}; "
+-            "planning requires PLANNING."
+-        )
+-        return 1
 +    Agents wrap output in markdown fences or add a sentence of preamble even
 +    when asked not to, and the ``--output-schema`` style flags are documented to
 +    be silently ignored when tools are active. So the response is treated as
@@ -2003,37 +2372,22 @@ index 02eecc4..4268cc7 100755
 +    if not text:
 +        return None
  
--    prompt = f"""You are the planning worker for {task_id}.
+-    run_codex_planning(task_id)
 +    start = text.find("{")
 +    end = text.rfind("}")
  
--Read the task requirement and inspect the repository.
+-    state["status"] = "AWAITING_APPROVAL"
+-    save_state(state_path, state)
 +    if start == -1 or end == -1 or end <= start:
 +        return None
  
--Planning only:
--- Do not modify application source code.
--- Do not create or delete repository files.
--- Do not run commands that change repository state.
--- Produce only valid YAML in your final response.
--- Do not use markdown code fences.
--
--Required top-level fields:
--objective:
--requirements:
--files_to_modify:
--files_to_create:
--acceptance_criteria:
--constraints:
--risks:
--open_questions:
--test_strategy:
+-    print(f"Task {task_id} moved to AWAITING_APPROVAL.")
+-    return 0
 +    return text[start : end + 1]
  
--Task requirement:
  
--{requirement_file.read_text()}
--"""
+-def approve_plan(task_id: str) -> int:
+-    state_path, state = load_state(task_id)
 +def run_structured_agent(
 +    agent: str,
 +    prompt: str,
@@ -2042,36 +2396,17 @@ index 02eecc4..4268cc7 100755
 +) -> Tuple[Optional[dict], Optional[str]]:
 +    """Run an agent read-only and parse its JSON response.
  
--    subprocess.run(
--        [
--            "codex",
--            "exec",
--            "--sandbox",
--            "read-only",
--            "--cd",
--            str(repo_root),
--            "--output-last-message",
--            str(plan_file),
--            prompt,
--        ],
--        cwd=repo_root,
--        check=True,
--    )
+-    if state["status"] != "AWAITING_APPROVAL":
+-        print(
+-            f"ERROR: TASK {task_id} is in state {state['status']}; "
+-            "approval requires AWAITING_APPROVAL."
 +    Returns ``(data, error)`` -- exactly one is None. Never raises for an
 +    unusable response: a reviewer that fails is reported as not having run,
 +    which is honest, rather than being turned into an empty finding list, which
 +    would read as "nothing wrong".
 +    """
 +    argv = claude_argv(agent, allowed_tools)
- 
--    print(f"Codex plan written to: {plan_file}")
--    record_event(
--        task_id,
--        "PLAN_CREATED",
--        plan_version=1,
--        plan_file=str(plan_file),
--        worker="codex",
--    )
++
 +    try:
 +        completed = subprocess.run(
 +            argv,
@@ -2081,72 +2416,24 @@ index 02eecc4..4268cc7 100755
 +            encoding="utf-8",
 +            timeout=timeout,
 +            input=prompt,
-+        )
+         )
+-        return 1
 +    except FileNotFoundError:
 +        return None, "claude executable not found on PATH"
 +    except subprocess.TimeoutExpired:
 +        return None, f"agent {agent} timed out after {timeout}s"
  
+-    if not (task_dir(task_id) / "plan.yaml").is_file():
+-        print("ERROR: plan.yaml is missing.")
+-        return 1
 +    if completed.returncode != 0:
 +        detail = (completed.stderr or "").strip()[:400]
 +        return None, f"agent {agent} exited {completed.returncode}: {detail}"
  
--def run_plan(task_id: str) -> int:
--    state_path, state = load_state(task_id)
-+    payload = extract_json_object(completed.stdout)
- 
--    if state["status"] != "PLANNING":
--        print(
--            f"ERROR: TASK {task_id} is in state {state['status']}; "
--            "planning requires PLANNING."
--        )
--        return 1
-+    if payload is None:
-+        return None, f"agent {agent} produced no JSON object"
- 
--    run_codex_planning(task_id)
-+    try:
-+        data = json.loads(payload)
-+    except json.JSONDecodeError as exc:
-+        return None, f"agent {agent} produced invalid JSON: {exc}"
- 
--    state["status"] = "AWAITING_APPROVAL"
--    save_state(state_path, state)
-+    if not isinstance(data, dict):
-+        return None, f"agent {agent} produced {type(data).__name__}, not an object"
- 
--    print(f"Task {task_id} moved to AWAITING_APPROVAL.")
--    return 0
-+    return data, None
- 
- 
--def approve_plan(task_id: str) -> int:
--    state_path, state = load_state(task_id)
-+def validate_findings(data: dict, dimension: str) -> List[str]:
-+    """Check reviewer output against the findings contract."""
-+    problems = []
- 
--    if state["status"] != "AWAITING_APPROVAL":
--        print(
--            f"ERROR: TASK {task_id} is in state {state['status']}; "
--            "approval requires AWAITING_APPROVAL."
-+    if data.get("dimension") != dimension:
-+        problems.append(
-+            "dimension is %r, expected %r" % (data.get("dimension"), dimension)
-         )
--        return 1
- 
--    if not (task_dir(task_id) / "plan.yaml").is_file():
--        print("ERROR: plan.yaml is missing.")
--        return 1
-+    findings = data.get("findings")
- 
 -    if has_event(task_id, "PLAN_APPROVED"):
 -        print(f"Task {task_id} is already approved.")
 -        return 0
-+    if not isinstance(findings, list):
-+        problems.append("findings must be a list")
-+        return problems
++    payload = extract_json_object(completed.stdout)
  
 -    record_event(
 -        task_id,
@@ -2156,36 +2443,27 @@ index 02eecc4..4268cc7 100755
 -    )
 -    print(f"Plan approved for {task_id}.")
 -    return 0
-+    for index, finding in enumerate(findings):
-+        if not isinstance(finding, dict):
-+            problems.append(f"findings[{index}] must be an object")
-+            continue
++    if payload is None:
++        return None, f"agent {agent} produced no JSON object"
  
-+        severity = finding.get("severity")
++    try:
++        data = json.loads(payload)
++    except json.JSONDecodeError as exc:
++        return None, f"agent {agent} produced invalid JSON: {exc}"
  
 -def run_claude_implementation(task_id: str) -> None:
 -    directory = task_dir(task_id)
 -    requirement_file = directory / "requirement.md"
 -    plan_file = directory / "plan.yaml"
-+        if severity not in FINDING_SEVERITIES:
-+            problems.append(
-+                f"findings[{index}] severity {severity!r} is not one of "
-+                + ", ".join(sorted(FINDING_SEVERITIES))
-+            )
++    if not isinstance(data, dict):
++        return None, f"agent {agent} produced {type(data).__name__}, not an object"
  
 -    prompt = f"""Implement {task_id} using the approved plan.
-+        for field in ("title", "detail"):
-+            if not finding.get(field) or not isinstance(
-+                finding.get(field), str
-+            ):
-+                problems.append(
-+                    f"findings[{index}] needs a non-empty string {field!r}"
-+                )
++    return data, None
  
 -Read:
 -- {requirement_file}
 -- {plan_file}
-+    return problems
  
 -Implementation rules:
 -- Implement only the approved scope.
@@ -2197,11 +2475,16 @@ index 02eecc4..4268cc7 100755
 -- Run the repository tests required by the approved plan.
 -- Write implementation notes to .ai/tasks/{task_id}/implementation.md.
 -- Do not write validation state; the orchestrator owns task state and validation evidence.
++def validate_findings(data: dict, dimension: str) -> List[str]:
++    """Check reviewer output against the findings contract."""
++    problems = []
  
 -The developer has explicitly approved the plan.
 -"""
-+def sha256_of(path: Path) -> str:
-+    """Hash raw file bytes.
++    if data.get("dimension") != dimension:
++        problems.append(
++            "dimension is %r, expected %r" % (data.get("dimension"), dimension)
++        )
  
 -    subprocess.run(
 -        [
@@ -2216,19 +2499,19 @@ index 02eecc4..4268cc7 100755
 -        cwd=Path.cwd(),
 -        check=True,
 -    )
-+    Deliberately unnormalised: the guarantee we want is that the bytes the
-+    developer approved are the bytes the implementer receives. Normalising
-+    would make textually different files hash equal, and without a YAML parser
-+    any normalisation is guesswork about what is semantically inert.
-+    """
-+    return hashlib.sha256(path.read_bytes()).hexdigest()
++    findings = data.get("findings")
  
++    if not isinstance(findings, list):
++        problems.append("findings must be a list")
++        return problems
  
 -def run_implementation(task_id: str) -> int:
 -    state_path, state = load_state(task_id)
 -    verify_implementation_branch(task_id, state)
-+def check_plan_wellformed(text: str) -> List[str]:
-+    """Structural pre-flight on a plan file. Returns a list of problems.
++    for index, finding in enumerate(findings):
++        if not isinstance(finding, dict):
++            problems.append(f"findings[{index}] must be an object")
++            continue
  
 -    if state["status"] != "AWAITING_APPROVAL":
 -        print(
@@ -2236,12 +2519,7 @@ index 02eecc4..4268cc7 100755
 -            "implementation requires AWAITING_APPROVAL."
 -        )
 -        return 1
-+    This is NOT a YAML parse -- the standard library has no YAML parser and
-+    Phase 0 forbids new dependencies. It catches the failure the audit
-+    describes: Codex emitting a markdown fence or a prose preamble around the
-+    plan, or omitting required keys, producing a file nothing can consume.
-+    """
-+    problems = []
++        severity = finding.get("severity")
  
 -    if not has_event(task_id, "PLAN_APPROVED"):
 -        print(
@@ -2249,8 +2527,11 @@ index 02eecc4..4268cc7 100755
 -            "Run the explicit approval action first."
 -        )
 -        return 1
-+    if not text.strip():
-+        return ["plan is empty"]
++        if severity not in FINDING_SEVERITIES:
++            problems.append(
++                f"findings[{index}] severity {severity!r} is not one of "
++                + ", ".join(sorted(FINDING_SEVERITIES))
++            )
  
 -    directory = task_dir(task_id)
 -    if not (directory / "plan.yaml").is_file() or not (
@@ -2258,12 +2539,17 @@ index 02eecc4..4268cc7 100755
 -    ).is_file():
 -        print("ERROR: requirement.md or plan.yaml is missing.")
 -        return 1
-+    lines = text.splitlines()
++        for field in ("title", "detail"):
++            if not finding.get(field) or not isinstance(
++                finding.get(field), str
++            ):
++                problems.append(
++                    f"findings[{index}] needs a non-empty string {field!r}"
++                )
  
 -    state["status"] = "IMPLEMENTING"
 -    save_state(state_path, state)
-+    if any(line.lstrip().startswith("```") for line in lines):
-+        problems.append("plan contains a markdown code fence")
++    return problems
  
 -    record_event(
 -        task_id,
@@ -2271,15 +2557,10 @@ index 02eecc4..4268cc7 100755
 -        worker="claude",
 -        branch=state.get("branch"),
 -    )
-+    missing = [
-+        key
-+        for key in PLAN_REQUIRED_KEYS
-+        if not any(line.startswith(key + ":") for line in lines)
-+    ]
  
 -    print(f"Task {task_id} moved to IMPLEMENTING.")
-+    if missing:
-+        problems.append("missing top-level keys: " + ", ".join(missing))
++def sha256_of(path: Path) -> str:
++    """Hash raw file bytes.
  
 -    try:
 -        run_claude_implementation(task_id)
@@ -2297,27 +2578,33 @@ index 02eecc4..4268cc7 100755
 -            failure_reason=state["failure_reason"],
 -        )
 -        return exc.returncode
-+    for line in lines:
-+        if not line.strip() or line.lstrip().startswith("#"):
-+            continue
++    Deliberately unnormalised: the guarantee we want is that the bytes the
++    developer approved are the bytes the implementer receives. Normalising
++    would make textually different files hash equal, and without a YAML parser
++    any normalisation is guesswork about what is semantically inert.
++    """
++    return hashlib.sha256(path.read_bytes()).hexdigest()
  
 -    state["status"] = "VALIDATING"
 -    save_state(state_path, state)
 -    record_event(task_id, "VALIDATION_STARTED", command="python3 -m unittest -v")
-+        if not TOP_LEVEL_KEY_RE.match(line):
-+            problems.append(
-+                "plan does not begin with a top-level key; found: "
-+                f"{line.strip()[:60]!r}"
-+            )
  
 -    print(f"Task {task_id} moved to VALIDATING.")
 -    return 0
-+        break
++def check_plan_wellformed(text: str) -> List[str]:
++    """Structural pre-flight on a plan file. Returns a list of problems.
  
-+    return problems
++    This is NOT a YAML parse -- the standard library has no YAML parser and
++    Phase 0 forbids new dependencies. It catches the failure the audit
++    describes: Codex emitting a markdown fence or a prose preamble around the
++    plan, or omitting required keys, producing a file nothing can consume.
++    """
++    problems = []
  
 -def run_validation(task_id: str) -> int:
 -    state_path, state = load_state(task_id)
++    if not text.strip():
++        return ["plan is empty"]
  
 -    if state["status"] != "VALIDATING":
 -        print(
@@ -2325,11 +2612,83 @@ index 02eecc4..4268cc7 100755
 -            "validation requires VALIDATING."
 -        )
 -        return 1
-+def load_plan(path: Path) -> dict:
-+    """Parse a plan file. JSON only -- a real parse, with the standard library.
++    lines = text.splitlines()
  
 -    directory = task_dir(task_id)
 -    results_file = directory / "test-results.json"
++    if any(line.lstrip().startswith("```") for line in lines):
++        problems.append("plan contains a markdown code fence")
+ 
+-    print(f"Running validation for {task_id}...")
++    missing = [
++        key
++        for key in PLAN_REQUIRED_KEYS
++        if not any(line.startswith(key + ":") for line in lines)
++    ]
+ 
+-    result = subprocess.run(
+-        ["python3", "-m", "unittest", "-v"],
+-        cwd=Path.cwd(),
+-        capture_output=True,
+-        text=True,
+-    )
++    if missing:
++        problems.append("missing top-level keys: " + ", ".join(missing))
+ 
+-    evidence = {
+-        "task_id": task_id,
+-        "command": "python3 -m unittest -v",
+-        "returncode": result.returncode,
+-        "passed": result.returncode == 0,
+-        "timestamp": now(),
+-        "stdout": result.stdout,
+-        "stderr": result.stderr,
+-    }
++    for line in lines:
++        if not line.strip() or line.lstrip().startswith("#"):
++            continue
+ 
+-    with results_file.open("w") as f:
+-        json.dump(evidence, f, indent=2)
+-        f.write("\n")
++        if not TOP_LEVEL_KEY_RE.match(line):
++            problems.append(
++                "plan does not begin with a top-level key; found: "
++                f"{line.strip()[:60]!r}"
++            )
+ 
+-    record_event(
+-        task_id,
+-        "VALIDATION",
+-        passed=result.returncode == 0,
+-        returncode=result.returncode,
+-        command="python3 -m unittest -v",
+-        evidence_file=str(results_file),
+-    )
++        break
+ 
+-    output = result.stdout + result.stderr
+-    if output:
+-        print(output, end="")
++    return problems
+ 
+-    if result.returncode == 0:
+-        state["status"] = "VALIDATED"
+-        state["failure_reason"] = None
+-        save_state(state_path, state)
+-        print(f"Task {task_id} moved to VALIDATED.")
+-        return 0
+ 
+-    state["status"] = "FAILED"
+-    state["failure_reason"] = (
+-        f"Validation command failed with exit code {result.returncode}"
+-    )
+-    save_state(state_path, state)
+-    print(f"Task {task_id} moved to FAILED.")
+-    return result.returncode
++def load_plan(path: Path) -> dict:
++    """Parse a plan file. JSON only -- a real parse, with the standard library.
+ 
 +    Plans were previously emitted as YAML and never parsed: Codex's raw last
 +    message was written straight to disk, so a fenced or truncated response
 +    became an unusable plan that nothing noticed. JSON gives a genuine parse
@@ -2343,58 +2702,45 @@ index 02eecc4..4268cc7 100755
 +            f"{path.with_suffix('.json').name}."
 +        )
  
--    print(f"Running validation for {task_id}...")
+-def run_review(task_id: str) -> int:
+-    state_path, state = load_state(task_id)
 +    try:
 +        data = json.loads(path.read_text(encoding="utf-8"))
 +    except json.JSONDecodeError as exc:
 +        raise RuntimeError(f"Plan {path} is not valid JSON: {exc}")
  
--    result = subprocess.run(
--        ["python3", "-m", "unittest", "-v"],
--        cwd=Path.cwd(),
--        capture_output=True,
--        text=True,
--    )
+-    if state["status"] != "VALIDATED":
+-        print(
+-            f"ERROR: TASK {task_id} is in state {state['status']}; "
+-            "review requires VALIDATED."
+-        )
+-        return 1
 +    if not isinstance(data, dict):
 +        raise RuntimeError(f"Plan {path} must be a JSON object.")
  
--    evidence = {
--        "task_id": task_id,
--        "command": "python3 -m unittest -v",
--        "returncode": result.returncode,
--        "passed": result.returncode == 0,
--        "timestamp": now(),
--        "stdout": result.stdout,
--        "stderr": result.stderr,
--    }
+-    subprocess.run(
+-        ["python3", ".ai/scripts/review-package.py", task_id],
+-        cwd=Path.cwd(),
+-        check=True,
+-    )
 +    return data
  
--    with results_file.open("w") as f:
--        json.dump(evidence, f, indent=2)
--        f.write("\n")
+-    state["status"] = "PR_READY"
+-    save_state(state_path, state)
  
 -    record_event(
 -        task_id,
--        "VALIDATION",
--        passed=result.returncode == 0,
--        returncode=result.returncode,
--        command="python3 -m unittest -v",
--        evidence_file=str(results_file),
+-        "PR_READY",
+-        branch=state.get("branch"),
+-        plan_version=state.get("plan_version", 1),
 +def _is_list_of_str(value) -> bool:
 +    return isinstance(value, list) and all(
 +        isinstance(item, str) for item in value
      )
  
--    output = result.stdout + result.stderr
--    if output:
--        print(output, end="")
+-    print(f"Task {task_id} moved to PR_READY.")
+-    return 0
  
--    if result.returncode == 0:
--        state["status"] = "VALIDATED"
--        state["failure_reason"] = None
--        save_state(state_path, state)
--        print(f"Task {task_id} moved to VALIDATED.")
--        return 0
 +def validate_plan(data: dict) -> List[str]:
 +    """Check a parsed plan against the contract. Returns a list of problems.
 +
@@ -2423,13 +2769,10 @@ index 02eecc4..4268cc7 100755
 +        if key not in data:
 +            continue
  
--    state["status"] = "FAILED"
--    state["failure_reason"] = (
--        f"Validation command failed with exit code {result.returncode}"
--    )
--    save_state(state_path, state)
--    print(f"Task {task_id} moved to FAILED.")
--    return result.returncode
+-def run_codex_replan(task_id: str) -> int:
+-    repo_root = Path.cwd()
+-    directory = task_dir(task_id)
+-    requirement_file = directory / "requirement.md"
 +        if not isinstance(data[key], list):
 +            problems.append(f"{key} must be a list")
 +            continue
@@ -2444,22 +2787,21 @@ index 02eecc4..4268cc7 100755
 +                    "a non-empty 'path'"
 +                )
  
+-    if not requirement_file.is_file():
+-        print(f"ERROR: Requirement not found: {requirement_file}")
+-        return 1
 +    criteria = data.get("acceptance_criteria")
  
--def run_review(task_id: str) -> int:
 -    state_path, state = load_state(task_id)
+-    plan_version = state.get("plan_version", 1)
+-    plan_file = directory / f"plan-v{plan_version}.yaml"
 +    if criteria is not None:
 +        if not isinstance(criteria, list) or not criteria:
 +            problems.append("acceptance_criteria must be a non-empty list")
 +        else:
 +            seen = set()
  
--    if state["status"] != "VALIDATED":
--        print(
--            f"ERROR: TASK {task_id} is in state {state['status']}; "
--            "review requires VALIDATED."
--        )
--        return 1
+-    prompt = f"""You are the planning worker for {task_id}.
 +            for index, entry in enumerate(criteria):
 +                if not isinstance(entry, dict):
 +                    problems.append(
@@ -2467,11 +2809,7 @@ index 02eecc4..4268cc7 100755
 +                    )
 +                    continue
  
--    subprocess.run(
--        ["python3", ".ai/scripts/review-package.py", task_id],
--        cwd=Path.cwd(),
--        check=True,
--    )
+-The previous approved plan encountered an architecture conflict.
 +                for field in ("id", "statement", "verify"):
 +                    if not entry.get(field) or not isinstance(
 +                        entry.get(field), str
@@ -2481,8 +2819,7 @@ index 02eecc4..4268cc7 100755
 +                            f"string '{field}'"
 +                        )
  
--    state["status"] = "PR_READY"
--    save_state(state_path, state)
+-Re-analyze the repository and produce a revised implementation contract.
 +                if "depends_on" in entry and not _is_list_of_str(
 +                    entry["depends_on"]
 +                ):
@@ -2491,12 +2828,23 @@ index 02eecc4..4268cc7 100755
 +                        "list of paths"
 +                    )
  
--    record_event(
--        task_id,
--        "PR_READY",
--        branch=state.get("branch"),
--        plan_version=state.get("plan_version", 1),
--    )
+-Planning only:
+-- Do not modify application source code.
+-- Do not create or delete repository files.
+-- Do not run state-changing commands.
+-- Produce only valid YAML.
+-- Do not use markdown code fences.
+-
+-Required top-level fields:
+-objective:
+-requirements:
+-files_to_modify:
+-files_to_create:
+-acceptance_criteria:
+-constraints:
+-risks:
+-open_questions:
+-test_strategy:
 +                if "material" in entry and not isinstance(
 +                    entry["material"], bool
 +                ):
@@ -2505,35 +2853,43 @@ index 02eecc4..4268cc7 100755
 +                        "boolean"
 +                    )
  
--    print(f"Task {task_id} moved to PR_READY.")
--    return 0
+-Task requirement:
 +                identifier = entry.get("id")
  
+-{requirement_file.read_text()}
+-"""
 +                if identifier in seen:
 +                    problems.append(
 +                        f"duplicate acceptance criterion id: {identifier}"
 +                    )
  
--def run_codex_replan(task_id: str) -> int:
--    repo_root = Path.cwd()
--    directory = task_dir(task_id)
--    requirement_file = directory / "requirement.md"
+-    subprocess.run(
+-        [
+-            "codex",
+-            "exec",
+-            "--sandbox",
+-            "read-only",
+-            "--cd",
+-            str(repo_root),
+-            "--output-last-message",
+-            str(plan_file),
+-            prompt,
+-        ],
+-        cwd=repo_root,
+-        check=True,
+-    )
 +                seen.add(identifier)
  
--    if not requirement_file.is_file():
--        print(f"ERROR: Requirement not found: {requirement_file}")
--        return 1
+-    record_event(
+-        task_id,
+-        "PLAN_CREATED",
+-        worker="codex",
 +    return problems
- 
--    state_path, state = load_state(task_id)
--    plan_version = state.get("plan_version", 1)
--    plan_file = directory / f"plan-v{plan_version}.yaml"
- 
--    prompt = f"""You are the planning worker for {task_id}.
++
++
 +def plan_problems(path: Path) -> List[str]:
 +    """Validate a plan file, dispatching on format.
- 
--The previous approved plan encountered an architecture conflict.
++
 +    Legacy ``.yaml`` plans get the structural pre-flight only, since they
 +    cannot be parsed without a YAML dependency.
 +    """
@@ -2560,26 +2916,8 @@ index 02eecc4..4268cc7 100755
 +            paths.append(entry["path"])
 +
 +    return paths
- 
--Re-analyze the repository and produce a revised implementation contract.
- 
--Planning only:
--- Do not modify application source code.
--- Do not create or delete repository files.
--- Do not run state-changing commands.
--- Produce only valid YAML.
--- Do not use markdown code fences.
--
--Required top-level fields:
--objective:
--requirements:
--files_to_modify:
--files_to_create:
--acceptance_criteria:
--constraints:
--risks:
--open_questions:
--test_strategy:
++
++
 +def resolve_plan_file(task_id: str, state: dict) -> Path:
 +    """Return the canonical plan file for a task.
 +
@@ -2591,38 +2929,16 @@ index 02eecc4..4268cc7 100755
 +
 +    if recorded:
 +        return Path(recorded)
- 
--Task requirement:
++
 +    directory = task_dir(task_id)
 +    candidate = directory / PLAN_FILENAME
- 
--{requirement_file.read_text()}
--"""
++
 +    if candidate.is_file():
 +        return candidate
- 
--    subprocess.run(
--        [
--            "codex",
--            "exec",
--            "--sandbox",
--            "read-only",
--            "--cd",
--            str(repo_root),
--            "--output-last-message",
--            str(plan_file),
--            prompt,
--        ],
--        cwd=repo_root,
--        check=True,
--    )
++
 +    # Tasks planned before the JSON migration.
 +    return directory / "plan.yaml"
- 
--    record_event(
--        task_id,
--        "PLAN_CREATED",
--        worker="codex",
++
 +
 +def record_event(task_id: str, event: str, **data) -> None:
 +    directory = task_dir(task_id)
@@ -2998,11 +3314,14 @@ index 02eecc4..4268cc7 100755
 +    return profile
 +
 +
-+def run_validation_check(check: dict) -> dict:
++def run_validation_check(check: dict, root: Optional[Path] = None) -> dict:
 +    """Run one profile check and return its result.
 +
 +    ``expect_test_count`` applies the empty-suite rule: a check that is supposed
 +    to run tests but reports none has not passed, whatever its exit code.
++
++    ``root`` is the tree the check runs against, so a task working in its
++    recorded worktree validates the code it actually changed.
 +    """
 +    # Tokenise first, then substitute. shlex uses POSIX escaping, so passing a
 +    # Windows interpreter path through it would eat the backslashes and produce
@@ -3017,7 +3336,7 @@ index 02eecc4..4268cc7 100755
 +    try:
 +        completed = subprocess.run(
 +            argv,
-+            cwd=Path.cwd(),
++            cwd=str(root or Path.cwd()),
 +            capture_output=True,
 +            text=True,
 +            encoding="utf-8",
@@ -3133,10 +3452,10 @@ index 02eecc4..4268cc7 100755
 +    return True, None, count
 +
 +
-+def current_branch() -> str:
++def current_branch(root: Optional[Path] = None) -> str:
 +    result = subprocess.run(
 +        ["git", "branch", "--show-current"],
-+        cwd=Path.cwd(),
++        cwd=str(root or Path.cwd()),
 +        capture_output=True,
 +        text=True,
 +        encoding="utf-8",
@@ -3147,7 +3466,9 @@ index 02eecc4..4268cc7 100755
 +
 +
 +def verify_implementation_branch(task_id: str, state: dict) -> None:
-+    branch = current_branch()
++    # The branch that matters is the one checked out where the work will happen,
++    # which is the recorded worktree when there is one.
++    branch = current_branch(execution_root(task_id, state))
 +
 +    if branch in PROTECTED_BRANCHES:
 +        raise RuntimeError(
@@ -3183,6 +3504,13 @@ index 02eecc4..4268cc7 100755
 +    rationale, implementation notes) is exactly what overflowed it. Richer
 +    context made the replan *less* likely to run, and the limit gets closer
 +    every time that context grows.
++
++    ``--output-last-message`` is normalised to an absolute, checkout-rooted path
++    for the same reason the worker prompts are: ``run_worker`` launches the
++    planner with cwd set to the task's recorded worktree, so a relative
++    ``.ai/tasks/<id>/plan.json`` names a file over there while the caller then
++    looks for the plan in the checkout, where the evidence is single-homed. See
++    ``authoritative_path``.
 +    """
 +    argv = [
 +        "codex",
@@ -3192,7 +3520,7 @@ index 02eecc4..4268cc7 100755
 +        "--cd",
 +        str(repo_root),
 +        "--output-last-message",
-+        str(plan_file),
++        str(authoritative_path(plan_file)),
 +    ]
 +
 +    if (repo_root / PLAN_SCHEMA_PATH).is_file():
@@ -3290,7 +3618,10 @@ index 02eecc4..4268cc7 100755
 +
 +
 +def run_codex_planning(task_id: str, extra: str = "") -> Path:
-+    repo_root = Path.cwd()
++    # The planner reads the checkout and writes its plan into the checkout's
++    # evidence directory; ``codex_argv`` makes the output path absolute so the
++    # worktree cwd ``run_worker`` supplies cannot redirect it.
++    checkout = repo_root()
 +    directory = task_dir(task_id)
 +    requirement_file = directory / "requirement.md"
 +    plan_file = directory / PLAN_FILENAME
@@ -3303,7 +3634,7 @@ index 02eecc4..4268cc7 100755
 +    )
 +
 +    run_worker(
-+        codex_argv(repo_root, plan_file),
++        codex_argv(checkout, plan_file),
 +        CODEX_TIMEOUT_S,
 +        task_id=task_id,
 +        stdin_text=prompt,
@@ -3593,6 +3924,98 @@ index 02eecc4..4268cc7 100755
 +    )
 +
 +
++def critique_file(task_id: str, plan_file: Path, attempt: int) -> Path:
++    """The path a critique round is persisted to.
++
++    Derivable from the task id, the plan's stem and the round, so a developer
++    told to read the critique at the approval gate can find it without reading
++    the implementation, and a reviewer can tell a stale round from the current
++    one.
++    """
++    return task_dir(task_id) / (
++        CRITIQUE_FILENAME_TEMPLATE % (Path(plan_file).stem, int(attempt))
++    )
++
++
++def normalise_critique_issues(issues) -> List[dict]:
++    """The critic's issues, as text and severity that survive to disk."""
++    found = []
++
++    for issue in issues or []:
++        if not isinstance(issue, dict):
++            continue
++
++        found.append(
++            {
++                "severity": issue.get("severity"),
++                "issue": issue.get("issue"),
++                "suggestion": issue.get("suggestion"),
++            }
++        )
++
++    return found
++
++
++def persist_critique(
++    task_id: str,
++    plan_file: Path,
++    state: dict,
++    attempt: int,
++    detail: dict,
++    acceptable: bool,
++) -> Path:
++    """Write a completed critique round's issue text to the task directory.
++
++    Orchestrator-owned evidence: the pre-tool-use guard denies a worker writing
++    any ``critique-*-round-*.json``, because a worker authoring its own
++    critique verdict is forging a checker's output.
++
++    ``rounds_exhausted`` is decided here rather than by the caller because both
++    inputs are already in hand -- the round number and whether the critic still
++    objects -- and the artifact the developer is sent to read at the approval
++    gate is exactly the one where both are true.
++    """
++    path = critique_file(task_id, plan_file, attempt)
++    issues = normalise_critique_issues(detail.get("issues"))
++    blocking = normalise_critique_issues(detail.get("blocking"))
++    exhausted = attempt >= CRITIC_MAX_ROUNDS and not acceptable
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    write_json_atomic(
++        path,
++        {
++            "task_id": task_id,
++            "plan_file": str(plan_file),
++            "plan_stem": Path(plan_file).stem,
++            "plan_version": (state or {}).get("plan_version", 1),
++            "round": int(attempt),
++            "max_rounds": CRITIC_MAX_ROUNDS,
++            "written_at": now(),
++            "ran": True,
++            "verdict": detail.get("verdict"),
++            "acceptable": bool(acceptable),
++            "rounds_exhausted": exhausted,
++            "issue_count": len(issues),
++            "blocking_count": len(blocking),
++            "issues": issues,
++            "blocking": blocking,
++        },
++    )
++
++    record_event(
++        task_id,
++        "PLAN_CRITIQUE_RECORDED",
++        critique_file=str(path),
++        plan_version=(state or {}).get("plan_version", 1),
++        plan_stem=Path(plan_file).stem,
++        round=int(attempt),
++        issues=len(issues),
++        blocking=len(blocking),
++        rounds_exhausted=exhausted,
++    )
++    return path
++
++
 +def critic_feedback(detail: dict) -> str:
 +    lines = ["", "A plan critic rejected the previous draft. Fix these:", ""]
 +
@@ -3667,6 +4090,13 @@ index 02eecc4..4268cc7 100755
 +                % (issue.get("severity", "?"), issue.get("issue", ""))
 +            )
 +
++    # Counting a critique is not recording it. The text goes to disk here, so
++    # the developer at the approval gate has something to read.
++    recorded = persist_critique(
++        task_id, plan_file, state, attempt, detail, acceptable
++    )
++    print(f"Critique recorded: {recorded}")
++
 +    return acceptable, True, detail
 +
 +
@@ -3688,33 +4118,48 @@ index 02eecc4..4268cc7 100755
 +    plan_file = None
 +    detail = {}
 +
-+    for attempt in range(1, CRITIC_MAX_ROUNDS + 1):
-+        plan_file = run_codex_planning(task_id, extra=extra)
-+        acceptable, ran, detail = critique_round(
-+            task_id, plan_file, state, attempt
-+        )
-+
-+        if not ran:
-+            break
-+
-+        if acceptable:
-+            print(f"Plan critic: pass (round {attempt}).")
-+            break
-+
-+        if attempt >= CRITIC_MAX_ROUNDS:
-+            print(
-+                f"Plan critic still objects after {CRITIC_MAX_ROUNDS} rounds. "
-+                "Presenting the plan to the developer with the critique "
-+                "recorded; read it before approving."
++    # A planning worker that exits non-zero used to let its CalledProcessError
++    # escape as a raw traceback, leaving the task in PLANNING with plan_file
++    # null and *no* PLAN_FAILED event -- so nothing in the trail recorded that
++    # planning had been attempted at all, only a WORKER_USAGE entry with a
++    # suspiciously short duration. `run_replan` already recorded REPLAN_FAILED
++    # for the identical failure mode, so this was the same asymmetry as the
++    # interrupted-implement dead end: handled on one entry point, unhandled on
++    # the other. Observed on TASK-008's own planning run, which died in an
++    # HTTP 400 from the planner.
++    try:
++        for attempt in range(1, CRITIC_MAX_ROUNDS + 1):
++            plan_file = run_codex_planning(task_id, extra=extra)
++            acceptable, ran, detail = critique_round(
++                task_id, plan_file, state, attempt
 +            )
-+            break
 +
-+        print(f"Plan critic: revise (round {attempt}). Replanning...")
-+        extra = (
-+            shared_context(task_id)
-+            + clarification_context(task_id)
-+            + critic_feedback(detail)
-+        )
++            if not ran:
++                break
++
++            if acceptable:
++                print(f"Plan critic: pass (round {attempt}).")
++                break
++
++            if attempt >= CRITIC_MAX_ROUNDS:
++                print(
++                    f"Plan critic still objects after {CRITIC_MAX_ROUNDS} "
++                    "rounds. Presenting the plan to the developer with the "
++                    "critique recorded; read it before approving."
++                )
++                break
++
++            print(f"Plan critic: revise (round {attempt}). Replanning...")
++            extra = (
++                shared_context(task_id)
++                + clarification_context(task_id)
++                + critic_feedback(detail)
++            )
++    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
++        return fail_planning(task_id, state_path, state, f"plan-worker: {exc}")
++
++    if plan_file is None:
++        return fail_planning(task_id, state_path, state, "Codex planning failed")
 +
 +    state["plan_file"] = str(plan_file)
 +    state["status"] = "AWAITING_APPROVAL"
@@ -3722,6 +4167,44 @@ index 02eecc4..4268cc7 100755
 +
 +    print(f"Task {task_id} moved to AWAITING_APPROVAL.")
 +    return 0
++
++
++def fail_planning(
++    task_id: str, state_path: Path, state: dict, reason: str
++) -> int:
++    """Land a failed planning run somewhere the developer can act on.
++
++    FAILED is routable -- ``route-failure`` accepts it and will send it to a
++    replan or to the developer. PLANNING was not: no verb accepted it except
++    ``plan`` itself, which would start over with no record that the first
++    attempt had happened.
++    """
++    print(f"ERROR: planning failed: {reason}")
++
++    state["status"] = "FAILED"
++    state["failure_reason"] = reason
++    save_state(state_path, state)
++
++    record_event(
++        task_id,
++        "PLAN_FAILED",
++        worker="codex",
++        plan_version=state.get("plan_version", 1),
++        failure_reason=reason,
++        detail=reason[:500],
++    )
++    append_context_block(
++        task_id,
++        "orchestrator",
++        "PLANNING",
++        "failure_observation",
++        "Planning failed: %s" % reason,
++    )
++    print(
++        f"Task {task_id} moved to FAILED: {reason}\n"
++        f"  Next: orchestrator.py {task_id} route-failure"
++    )
++    return 1
 +
 +
 +def approve_plan(task_id: str) -> int:
@@ -3782,19 +4265,24 @@ index 02eecc4..4268cc7 100755
 +
 +
 +def run_claude_implementation(task_id: str, plan_file: Path) -> None:
-+    directory = task_dir(task_id)
++    # Absolute, checkout-rooted: the worker runs in the task's worktree, where
++    # the same relative paths name a committed copy of this evidence. See
++    # ``authoritative_path``.
++    directory = evidence_dir(task_id)
 +    requirement_file = directory / "requirement.md"
++    notes_file = directory / "implementation.md"
++    state_file = directory / "state.json"
 +
 +    prompt = f"""Implement {task_id} using the approved plan.
 +{shared_context(task_id)}
 +Read:
 +- {requirement_file}
-+- {plan_file}
++- {authoritative_path(plan_file)}
 +
 +Implementation rules:
 +- Implement only the approved scope.
 +- Preserve existing behavior outside that scope.
-+- Do not modify .ai/tasks/{task_id}/state.json.
++- Do not modify {state_file}.
 +- Do not create or modify test-results.json.
 +- Change only the files the approved plan declares in files_to_modify and
 +  files_to_create. Workflow infrastructure is writable only when the plan
@@ -3803,7 +4291,7 @@ index 02eecc4..4268cc7 100755
 +  about.
 +- Do not commit or push.
 +- Run the repository tests required by the approved plan.
-+- Write implementation notes to .ai/tasks/{task_id}/implementation.md.
++- Write implementation notes to {notes_file}.
 +- Do not write validation state; the orchestrator owns task state and validation evidence.
 +
 +The developer has explicitly approved the plan.
@@ -4120,6 +4608,39 @@ index 02eecc4..4268cc7 100755
 +    return 0
 +
 +
++def last_recorded_failure_reason(task_id: str) -> Optional[str]:
++    """The most recent failure reason in the append-only trail.
++
++    ``failure_reason`` is cleared when a task leaves FAILED, so a prompt built
++    after routing must read the trail rather than the live state. That is the
++    right source anyway: the reason is evidence, and evidence belongs in
++    events.jsonl rather than in a mutable status field that outlives the
++    failure it described.
++    """
++    reason = None
++
++    for event in iter_events(task_id):
++        candidate = event.get("failure_reason")
++
++        if isinstance(candidate, str) and candidate.strip():
++            reason = candidate.strip()
++
++    return reason
++
++
++def leave_failed(state: dict, status: str) -> None:
++    """Move a task out of FAILED, dropping the reason that put it there.
++
++    The reason is recorded in FAILURE_ROUTED before this runs and stays in the
++    trail, so nothing is lost. What it prevents is a resolved failure reading
++    as a live one: TASK-007's state.json carried
++    ``fix-precondition: plan_rejected`` from a superseded routing decision
++    while its status was IMPLEMENTING and its approval gate had passed.
++    """
++    state["status"] = status
++    state["failure_reason"] = None
++
++
 +def failure_evidence(task_id: str, state: dict, limit: int = 4000) -> str:
 +    """Everything the system knows about why a task failed.
 +
@@ -4131,7 +4652,9 @@ index 02eecc4..4268cc7 100755
 +    directory = task_dir(task_id)
 +    parts = []
 +
-+    reason = state.get("failure_reason")
++    reason = state.get("failure_reason") or last_recorded_failure_reason(
++        task_id
++    )
 +
 +    if reason:
 +        parts.append("Recorded failure reason: %s" % reason)
@@ -4257,18 +4780,27 @@ index 02eecc4..4268cc7 100755
 +    Sending the worker back in with no information about what broke would just
 +    re-derive the same implementation.
 +    """
-+    directory = task_dir(task_id)
++    # Absolute for the same reason as the implement prompt: the fix worker also
++    # runs in the recorded worktree. See ``authoritative_path``.
++    directory = evidence_dir(task_id)
 +    requirement_file = directory / "requirement.md"
-+    results_file = directory / "test-results.json"
++    notes_file = directory / "implementation.md"
++    state_file = directory / "state.json"
 +
-+    failure_reason = state.get("failure_reason") or "unspecified failure"
++    # Routing clears failure_reason on the way out of FAILED, so the live state
++    # no longer carries it by the time a fix runs. The trail still does.
++    failure_reason = (
++        state.get("failure_reason")
++        or last_recorded_failure_reason(task_id)
++        or "unspecified failure"
++    )
 +    evidence = failure_evidence(task_id, state)
 +
 +    prompt = f"""Fix the failing implementation for {task_id}.
 +{shared_context(task_id)}
 +Read:
 +- {requirement_file}
-+- {plan_file}
++- {authoritative_path(plan_file)}
 +
 +The previous implementation attempt failed validation.
 +
@@ -4278,13 +4810,13 @@ index 02eecc4..4268cc7 100755
 +- Stay within the approved plan's scope.
 +- Fix the cause of the failure; do not weaken or delete tests to make them pass.
 +- Preserve existing behavior outside the approved scope.
-+- Do not modify .ai/tasks/{task_id}/state.json.
++- Do not modify {state_file}.
 +- Do not create or modify test-results.json.
 +- Change only the files the approved plan declares in files_to_modify and
 +  files_to_create; the PreToolUse hook enforces that against the approved
 +  plan's bytes.
 +- Do not commit or push.
-+- Append what changed to .ai/tasks/{task_id}/implementation.md.
++- Append what changed to {notes_file}.
 +- Do not write validation state; the orchestrator owns task state and validation evidence.
 +"""
 +
@@ -4392,6 +4924,255 @@ index 02eecc4..4268cc7 100755
 +    return enter_validating(task_id, state_path, state)
 +
 +
++def last_implementation_attempt(
++    task_id: str,
++) -> Tuple[Optional[dict], Optional[str]]:
++    """The most recent implementation attempt and what ended it.
++
++    Returns ``(started_event, terminating_event_name)``. A later
++    IMPLEMENTATION_STARTED supersedes an earlier attempt's outcome, so the
++    answer is about the attempt currently in flight rather than about the
++    trail as a whole.
++    """
++    started = None
++    terminator = None
++
++    for event in iter_events(task_id):
++        name = event.get("event")
++
++        if name == "IMPLEMENTATION_STARTED":
++            started, terminator = event, None
++        elif started is not None and name in IMPLEMENTATION_TERMINATING_EVENTS:
++            terminator = name
++
++    return started, terminator
++
++
++def recovery_eligibility(task_id: str, state: dict) -> Tuple[bool, str]:
++    """Whether an interrupted implementation can be recovered. Fail-closed.
++
++    Returns ``(eligible, detail)``. Three independent refusals, and each one
++    matters on its own: without them ``recover`` would be an unconditional
++    status setter that accepts a task in any state, one whose attempt already
++    ended, or one already routed to ``fix`` -- which is precisely the hand-edit
++    this verb exists to remove, wearing a verb's clothes.
++    """
++    status = state.get("status")
++
++    if status != "IMPLEMENTING":
++        return (
++            False,
++            "recovery requires IMPLEMENTING, and this task is %s" % status,
++        )
++
++    if has_event(task_id, "CLAUDE_FIX_STARTED"):
++        return (
++            False,
++            "the task carries CLAUDE_FIX_STARTED, so `fix` is its legal verb "
++            "and there is no interruption for `recover` to close",
++        )
++
++    started, terminator = last_implementation_attempt(task_id)
++
++    if started is None:
++        return (
++            False,
++            "no IMPLEMENTATION_STARTED event records an attempt, so an "
++            "interruption cannot be established",
++        )
++
++    if terminator is not None:
++        return (
++            False,
++            "the last implementation attempt already ended in %s, so it was "
++            "not interrupted" % terminator,
++        )
++
++    return (
++        True,
++        "an unterminated %s attempt is recorded"
++        % (started.get("mode") or "implement"),
++    )
++
++
++def lock_holder(lock_path: Path) -> Optional[str]:
++    """What a lock file says about its holder, as advisory detail only.
++
++    Recorded in the event so a developer can see whose pid was named. It is
++    never consulted as authorisation: ``os.kill(pid, 0)`` is unsafe on Windows,
++    where Python maps a non-CTRL signal to ``TerminateProcess`` -- so a probe
++    asking "is this alive" can terminate a running orchestrator. Only a
++    developer's explicit assertion authorises recovery past a lock.
++    """
++    try:
++        return lock_path.read_text(encoding="utf-8").strip() or None
++    except OSError:
++        return None
++
++
++def run_recover(task_id: str, reason: str = "") -> int:
++    """Close out an implementation attempt that was interrupted.
++
++    ``IMPLEMENTING`` had exactly one exit -- ``fix`` -- and ``fix`` requires a
++    CLAUDE_FIX_STARTED event that only ``route-failure`` can emit, which itself
++    requires FAILED. An ``implement`` run killed between
++    IMPLEMENTATION_STARTED and its outcome therefore had no legal verb at all:
++    ``implement`` wants AWAITING_APPROVAL, ``validate`` wants VALIDATING,
++    ``route-failure`` wants FAILED, and ``run`` deliberately stops. The task
++    could only be moved by hand-editing state.json -- verbatim the defect
++    ``run_fix``'s own docstring says it was written to remove, closed for the
++    route-failure entry into IMPLEMENTING and left open for this one.
++
++    This does not resume, re-run, validate or complete anything, and it never
++    manufactures a pass. It records that an attempt was interrupted, on a
++    developer's explicit assertion, and parks the task in FAILED -- which
++    ``route-failure`` classifies like any other failure. The work on disk is
++    left exactly as the interrupted worker left it: a recovery that reset or
++    re-captured files would destroy the evidence it exists to preserve.
++
++    Recovery metadata stays in ``events.jsonl``. ``task-state.schema.json``
++    sets ``additionalProperties: false``, so a ``recovered_at`` or
++    ``recovered_by`` field in state.json would fail state validation -- and the
++    trail is where an attributable human assertion belongs anyway.
++    """
++    reason = (reason or "").strip()
++
++    if not reason:
++        print(
++            "ERROR: recovery needs a reason -- what interrupted the run. It is "
++            "recorded as the failure reason and shown to the classifier, and "
++            "a recovery with no stated cause is a hand edit with extra steps.\n"
++            '  orchestrator.py %s recover "<what interrupted it>"' % task_id
++        )
++        return 1
++
++    asserted_by = (
++        os.environ.get(RECOVER_ASSERTER_ENV) or ""
++    ).strip() or "developer"
++
++    state_path, state = load_state(task_id)
++
++    # Eligibility first, and before anything is written: a refusal must leave
++    # the state and the event trail exactly as it found them.
++    eligible, detail = recovery_eligibility(task_id, state)
++
++    if not eligible:
++        print(f"ERROR: TASK {task_id} cannot be recovered: {detail}")
++        return 1
++
++    lock_path = task_dir(task_id) / ".lock"
++    override = (
++        os.environ.get(RECOVER_LOCK_OVERRIDE_ENV) or ""
++    ).strip()
++    # Whether a lock *exists* is the fail-closed question; what it says about
++    # its holder is advisory detail that may be missing. ``task_lock`` creates
++    # the file with O_CREAT|O_EXCL and writes the pid line afterwards, so a
++    # process killed between the two leaves a zero-byte lock -- exactly the
++    # interruption this verb exists for. Reading the holder as the flag would
++    # make that lock override itself: unrecorded and never removed, stranding
++    # the next verb behind a lock nobody claims.
++    locked = lock_path.exists()
++    holder = lock_holder(lock_path) if locked else None
++
++    if locked:
++        if not override:
++            print(
++                f"ERROR: TASK {task_id} is locked ({holder or 'unknown'}) and "
++                "recovery is fail-closed on the lock.\n"
++                "  A lock may mean an orchestrator is still running, and no "
++                "liveness probe can settle that safely -- so this needs a "
++                "developer to assert it.\n"
++                f"  {RECOVER_LOCK_OVERRIDE_ENV}=\"<your name>\" "
++                f'orchestrator.py {task_id} recover "<reason>"'
++            )
++            return 1
++
++    started, _ = last_implementation_attempt(task_id)
++    failure = "interrupted-implementation: %s" % reason
++
++    if locked:
++        print(
++            f"Lock override asserted by {override} (lock held by "
++            f"{holder or 'unknown'})."
++        )
++        removed = True
++
++        try:
++            lock_path.unlink()
++        except FileNotFoundError:
++            pass
++        except OSError as exc:
++            # The likeliest cause on Windows is a process still holding the
++            # file open -- the case the override was wrong about. Reporting the
++            # removal as done would tell the developer the task can proceed
++            # when the next mutating verb will refuse.
++            removed = False
++            print(
++                f"WARNING: {lock_path} could not be removed: {exc}\n"
++                "  The lock is still there, so the next mutating verb will "
++                "refuse. Remove it by hand once you are sure no orchestrator "
++                "is running."
++            )
++        else:
++            print(f"  Removed {lock_path}.")
++
++        record_event(
++            task_id,
++            "RECOVERY_LOCK_OVERRIDDEN",
++            lock_file=str(lock_path),
++            lock_holder=holder or "unknown",
++            asserted_by=override,
++            assertion="human",
++            lock_removed=removed,
++            note="a developer asserted no orchestrator holds this lock; the "
++            "recorded pid is advisory detail and was not probed",
++        )
++
++    record_event(
++        task_id,
++        "IMPLEMENTATION_INTERRUPTED",
++        worker="orchestrator",
++        mode=(started or {}).get("mode"),
++        started_at=(started or {}).get("timestamp"),
++        reason=reason,
++        failure_reason=failure,
++        asserted_by=asserted_by,
++        assertion="human",
++        eligibility=detail,
++        lock_overridden=locked,
++    )
++
++    state["status"] = "FAILED"
++    state["failure_reason"] = failure
++    save_state(state_path, state)
++
++    record_event(
++        task_id,
++        "TASK_RECOVERED",
++        from_state="IMPLEMENTING",
++        to_state="FAILED",
++        reason=reason,
++        asserted_by=asserted_by,
++    )
++    append_context_block(
++        task_id,
++        "orchestrator",
++        "IMPLEMENTING",
++        "failure_observation",
++        "Implementation attempt recovered as interrupted on %s's assertion: "
++        "%s. Work on disk was left untouched; classification is "
++        "route-failure's to make." % (asserted_by, reason),
++    )
++
++    print(
++        f"Task {task_id} moved to FAILED: {failure}\n"
++        f"  Asserted by: {asserted_by}\n"
++        f"  Work on disk was not touched.\n"
++        f"  Next: orchestrator.py {task_id} route-failure"
++    )
++    return 0
++
++
 +def normalise_repo_path(path: str) -> str:
 +    """Canonical repo-relative form: forward slashes, no ``./`` prefix.
 +
@@ -4421,16 +5202,20 @@ index 02eecc4..4268cc7 100755
 +    return any(part in BASELINE_EXCLUDE_SEGMENTS for part in path.split("/"))
 +
 +
-+def enumerate_tree() -> List[str]:
++def enumerate_tree(root: Optional[Path] = None) -> List[str]:
 +    """Every file git considers part of the working tree.
 +
 +    ``--cached --others --exclude-standard`` is tracked files plus untracked
 +    ones ``.gitignore`` does not cover -- exactly the set a worker can change.
 +    One subprocess, and ``.gitignore`` is honoured for free.
++
++    ``root`` is the tree to enumerate: a task's recorded worktree when it has
++    one. Paths come back relative to it either way, so a manifest stays
++    comparable with the plan's declared paths.
 +    """
 +    result = subprocess.run(
 +        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-+        cwd=Path.cwd(),
++        cwd=str(root or Path.cwd()),
 +        capture_output=True,
 +        text=True,
 +        encoding="utf-8",
@@ -4465,7 +5250,7 @@ index 02eecc4..4268cc7 100755
 +    return digest.hexdigest()
 +
 +
-+def tree_manifest() -> Tuple[dict, bool]:
++def tree_manifest(root: Optional[Path] = None) -> Tuple[dict, bool]:
 +    """Hash the working tree. Returns ``(entries, truncated)``.
 +
 +    Raw working-tree bytes, not git blob ids. Both sides of every comparison
@@ -4473,16 +5258,17 @@ index 02eecc4..4268cc7 100755
 +    cancels out. Blob ids would not: git normalises line endings on the way
 +    into the index, so a CRLF-only change would hash identical.
 +    """
++    base = Path(root or Path.cwd())
 +    entries: dict = {}
 +    total = 0
 +    truncated = False
 +
-+    for path in enumerate_tree():
++    for path in enumerate_tree(base):
 +        if len(entries) >= BASELINE_MAX_ENTRIES or total > BASELINE_MAX_BYTES:
 +            truncated = True
 +            break
 +
-+        full = Path(path)
++        full = base / path
 +
 +        # --cached lists index entries, including files deleted from the tree.
 +        if not full.is_file():
@@ -4515,10 +5301,10 @@ index 02eecc4..4268cc7 100755
 +    ).hexdigest()
 +
 +
-+def git_head() -> Optional[str]:
++def git_head(root: Optional[Path] = None) -> Optional[str]:
 +    result = subprocess.run(
 +        ["git", "rev-parse", "HEAD"],
-+        cwd=Path.cwd(),
++        cwd=str(root or Path.cwd()),
 +        capture_output=True,
 +        text=True,
 +        encoding="utf-8",
@@ -4544,16 +5330,20 @@ index 02eecc4..4268cc7 100755
 +    if path.is_file():
 +        return load_baseline(task_id)
 +
-+    entries, truncated = tree_manifest()
++    # The tree that is about to be worked on, which is the recorded worktree
++    # when there is one. The baseline itself stays in the orchestrator
++    # checkout: the snapshot is evidence, and evidence is single-homed.
++    root = execution_root(task_id, state)
++    entries, truncated = tree_manifest(root)
 +
 +    payload = {
 +        "task_id": task_id,
 +        "captured_at": now(),
 +        "plan_version_at_capture": state.get("plan_version", 1),
 +        "git": {
-+            "head": git_head(),
-+            "branch": current_branch() or None,
-+            "merge_base": resolve_diff_base(),
++            "head": git_head(root),
++            "branch": current_branch(root) or None,
++            "merge_base": resolve_diff_base(root),
 +        },
 +        "manifest_algo": "sha256",
 +        "entry_count": len(entries),
@@ -4635,14 +5425,27 @@ index 02eecc4..4268cc7 100755
 +    return payload
 +
 +
-+def compute_task_delta(baseline: dict) -> dict:
++def baseline_head(baseline: Optional[dict]) -> Optional[str]:
++    """The commit the baseline was captured at, if it recorded one.
++
++    Manifests written before this existed simply do not have it, and the
++    caller's job then is to omit committed-history evidence rather than
++    substitute a different base.
++    """
++    git = baseline.get("git") if isinstance(baseline, dict) else None
++    head = git.get("head") if isinstance(git, dict) else None
++
++    return head.strip() if isinstance(head, str) and head.strip() else None
++
++
++def compute_task_delta(baseline: dict, root: Optional[Path] = None) -> dict:
 +    """What changed in the working tree since the baseline was captured.
 +
 +    Content-based, so it sees uncommitted work. That matters because the
 +    implementer never commits: a commit-based comparison reports an empty
 +    change set for every task this workflow has ever run.
 +    """
-+    entries, truncated = tree_manifest()
++    entries, truncated = tree_manifest(root)
 +    base = baseline.get("entries") or {}
 +
 +    created = sorted(path for path in entries if path not in base)
@@ -4657,6 +5460,7 @@ index 02eecc4..4268cc7 100755
 +    return {
 +        "baseline_sha256": baseline.get("baseline_sha256"),
 +        "baseline_captured_at": baseline.get("captured_at"),
++        "baseline_head": baseline_head(baseline),
 +        "plan_version_at_capture": baseline.get("plan_version_at_capture"),
 +        "created": created,
 +        "modified": modified,
@@ -4713,7 +5517,10 @@ index 02eecc4..4268cc7 100755
 +
 +
 +def evaluate_acceptance_criteria(
-+    task_id: str, state: dict, delta: Optional[dict] = None
++    task_id: str,
++    state: dict,
++    delta: Optional[dict] = None,
++    root: Optional[Path] = None,
 +) -> dict:
 +    """Execute each acceptance criterion's ``verify`` command.
 +
@@ -4734,6 +5541,7 @@ index 02eecc4..4268cc7 100755
 +    so in the plan with ``material: false``, which goes through the developer's
 +    hash-bound approval like everything else in the contract.
 +    """
++    tree = root if root is not None else execution_root(task_id, state)
 +    plan_file = resolve_plan_file(task_id, state)
 +    summary = {
 +        "total": 0,
@@ -4806,7 +5614,7 @@ index 02eecc4..4268cc7 100755
 +            completed = subprocess.run(
 +                command,
 +                shell=True,
-+                cwd=Path.cwd(),
++                cwd=str(tree),
 +                capture_output=True,
 +                text=True,
 +                encoding="utf-8",
@@ -4866,10 +5674,12 @@ index 02eecc4..4268cc7 100755
 +    return summary
 +
 +
-+def changed_files_against_base(base_sha: str) -> List[str]:
++def changed_files_against_base(
++    base_sha: str, root: Optional[Path] = None
++) -> List[str]:
 +    result = subprocess.run(
 +        ["git", "diff", "--name-only", f"{base_sha}...HEAD"],
-+        cwd=Path.cwd(),
++        cwd=str(root or Path.cwd()),
 +        capture_output=True,
 +        text=True,
 +        encoding="utf-8",
@@ -4882,11 +5692,18 @@ index 02eecc4..4268cc7 100755
 +    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 +
 +
-+def resolve_diff_base() -> Optional[str]:
++def resolve_diff_base(root: Optional[Path] = None) -> Optional[str]:
++    """The branch point against the base ref, for review context only.
++
++    Deliberately *not* the base for a task's committed evidence: on a feature
++    branch several commits ahead this is the fork point, so a diff against it
++    lists everything the branch has ever carried -- 74 files for TASK-007, none
++    of which that task produced. See ``baseline_head``.
++    """
 +    for ref in BASE_REF_CANDIDATES:
 +        result = subprocess.run(
 +            ["git", "merge-base", ref, "HEAD"],
-+            cwd=Path.cwd(),
++            cwd=str(root or Path.cwd()),
 +            capture_output=True,
 +            text=True,
 +            encoding="utf-8",
@@ -4899,8 +5716,107 @@ index 02eecc4..4268cc7 100755
 +    return None
 +
 +
++def path_under(path: str, prefix: str) -> bool:
++    """Component-aware containment: ``a/b`` covers ``a/b/c``, never ``a/bc``.
++
++    A plain ``startswith`` would attribute ``.worktrees/TASK-0012/x`` to
++    ``.worktrees/TASK-001``, which is how an over-broad prefix hides a real
++    scope violation.
++    """
++    candidate = normalise_repo_path(path).rstrip("/")
++    boundary = normalise_repo_path(prefix).rstrip("/")
++
++    if not candidate or not boundary:
++        return False
++
++    return candidate == boundary or candidate.startswith(boundary + "/")
++
++
++def other_open_tasks(task_id: str) -> List[Tuple[str, str]]:
++    """``(owner, path prefix)`` pairs owned by another task that is still open.
++
++    Structural ownership only: another task's recorded worktree, and its own
++    ``.ai/tasks/<id>/`` directory. Deliberately *not* the paths another task's
++    plan declares -- that would make one task's plan an authorisation input for
++    another task's validation, so a plan could widen a scope check it was never
++    reviewed against.
++
++    A task with no readable state, or one that has COMPLETED, owns nothing: a
++    finished task's paths are ordinary tree contents again.
++    """
++    owned: List[Tuple[str, str]] = []
++    root = Path(".ai") / "tasks"
++
++    if not root.is_dir():
++        return owned
++
++    for child in sorted(root.iterdir()):
++        if not child.is_dir() or child.name == task_id:
++            continue
++
++        if not TASK_ID_RE.match(child.name):
++            continue
++
++        try:
++            _, other = load_state(child.name)
++        except (FileNotFoundError, OSError, ValueError):
++            continue
++
++        if other.get("status") in FOREIGN_OWNER_TERMINAL_STATES:
++            continue
++
++        owned.append(
++            (child.name, normalise_repo_path((root / child.name).as_posix()))
++        )
++
++        recorded = other.get("worktree")
++
++        if isinstance(recorded, str) and recorded.strip():
++            owned.append((child.name, normalise_repo_path(recorded.strip())))
++
++    return owned
++
++
++def classify_foreign_paths(
++    task_id: str, paths: List[str]
++) -> Tuple[List[str], List[dict]]:
++    """Split paths into this task's own and another open task's.
++
++    Returns ``(mine, foreign)``. ``foreign`` is report metadata and nothing
++    else: it is recorded, it is not blocking, and it never authorises a write.
++
++    The delta is still the whole tree. What this changes is attribution -- a
++    task's delta used to grow for as long as the task stayed open, so two
++    tasks could not be in flight at once and an interrupted task made the tree
++    unusable for anything else.
++    """
++    owners = other_open_tasks(task_id)
++    mine: List[str] = []
++    foreign: List[dict] = []
++
++    for path in paths:
++        owner = next(
++            (
++                owner
++                for owner, prefix in owners
++                if path_under(path, prefix)
++            ),
++            None,
++        )
++
++        if owner is None:
++            mine.append(path)
++        else:
++            foreign.append({"path": path, "owner": owner})
++
++    return mine, foreign
++
++
 +def evaluate_diff_scope(
-+    task_id: str, state: dict, delta: Optional[dict] = None
++    task_id: str,
++    state: dict,
++    delta: Optional[dict] = None,
++    root: Optional[Path] = None,
 +) -> dict:
 +    """Compare what the task produced against what the plan declared.
 +
@@ -4917,11 +5833,13 @@ index 02eecc4..4268cc7 100755
 +    ``"changed": []``, and the check passed. The committed set is still
 +    recorded, as corroboration rather than as the measurement.
 +    """
++    tree = root if root is not None else execution_root(task_id, state)
 +    plan_file = resolve_plan_file(task_id, state)
 +    summary = {
 +        "declared": [],
 +        "changed": [],
 +        "violations": [],
++        "foreign": [],
 +        "unproduced": [],
 +    }
 +
@@ -4961,24 +5879,38 @@ index 02eecc4..4268cc7 100755
 +    summary["modified"] = delta["modified"]
 +    summary["deleted"] = delta["deleted"]
 +
-+    base = resolve_diff_base()
++    # Committed corroboration starts at the commit the baseline recorded, not
++    # at the branch point. merge-base(main, HEAD) on a branch several commits
++    # ahead is the fork point, so this listed everything the branch had ever
++    # carried and presented it as this task's evidence. A baseline that
++    # recorded no head gets no committed evidence at all: omitting it is
++    # honest, and substituting a different base is not.
++    base = delta.get("baseline_head")
 +
-+    if base is not None:
++    if base:
 +        summary["base"] = base
-+        committed = changed_files_against_base(base)
++        committed = changed_files_against_base(base, tree)
 +        summary["committed_changed"] = committed
 +        # A committed change absent from the delta means history moved or the
 +        # change was reverted. Recorded rather than assumed away.
 +        summary["committed_not_in_delta"] = sorted(
 +            set(committed) - changed_set
 +        )
++    else:
++        summary["committed_evidence_omitted"] = (
++            "the task baseline recorded no git.head, so there is no commit to "
++            "measure committed changes from"
++        )
 +
-+    summary["violations"] = [
++    undeclared = [
 +        path
 +        for path in changed
 +        if path not in declared
 +        and not any(path.startswith(prefix) for prefix in DIFF_SCOPE_ALLOWLIST)
 +    ]
++    violations, foreign = classify_foreign_paths(task_id, undeclared)
++    summary["violations"] = violations
++    summary["foreign"] = foreign
 +
 +    unproduced = []
 +
@@ -4986,7 +5918,7 @@ index 02eecc4..4268cc7 100755
 +        if path in created:
 +            continue
 +
-+        if Path(path).is_file():
++        if (tree / path).is_file():
 +            reason = (
 +                "declared as created but already existed at the task baseline"
 +            )
@@ -5007,7 +5939,7 @@ index 02eecc4..4268cc7 100755
 +            reason = (
 +                "declared as modified but did not exist at the task baseline"
 +            )
-+        elif Path(path).is_file():
++        elif (tree / path).is_file():
 +            reason = (
 +                "declared as modified but is byte-identical to the task "
 +                "baseline"
@@ -5035,11 +5967,12 @@ index 02eecc4..4268cc7 100755
 +
 +    directory = task_dir(task_id)
 +    results_file = directory / "test-results.json"
++    tree = execution_root(task_id, state)
 +
 +    print(f"Running validation for {task_id}...")
 +
 +    profile = load_validation_profile()
-+    checks = [run_validation_check(check) for check in profile["checks"]]
++    checks = [run_validation_check(check, tree) for check in profile["checks"]]
 +
 +    for check in checks:
 +        mark = "PASS" if check["passed"] else "FAIL"
@@ -5068,12 +6001,12 @@ index 02eecc4..4268cc7 100755
 +    delta = None
 +
 +    try:
-+        delta = compute_task_delta(load_baseline(task_id))
++        delta = compute_task_delta(load_baseline(task_id), tree)
 +    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
 +        baseline_error = str(exc)
 +
-+    criteria = evaluate_acceptance_criteria(task_id, state, delta)
-+    scope = evaluate_diff_scope(task_id, state, delta)
++    criteria = evaluate_acceptance_criteria(task_id, state, delta, tree)
++    scope = evaluate_diff_scope(task_id, state, delta, tree)
 +
 +    if baseline_error is not None:
 +        blocking.append(
@@ -5171,6 +6104,7 @@ index 02eecc4..4268cc7 100755
 +        acceptance_criteria_failed=criteria.get("failed"),
 +        acceptance_criteria_unproven=criteria.get("unproven"),
 +        diff_scope_violations=len(scope.get("violations") or []),
++        diff_scope_foreign=len(scope.get("foreign") or []),
 +        declared_not_produced=len(scope.get("unproduced") or []),
 +        baseline_sha256=(delta or {}).get("baseline_sha256"),
 +        task_delta_counts=None
@@ -5221,6 +6155,14 @@ index 02eecc4..4268cc7 100755
 +
 +        for item in scope["unproduced"]:
 +            print(f"  {item['path']}: {item['reason']}")
++
++    if scope.get("foreign"):
++        # Recorded, never blocking: these paths structurally belong to another
++        # task that is still open, so they are not this task's to answer for.
++        print("Changed by another open task (recorded, not blocking):")
++
++        for item in scope["foreign"]:
++            print(f"  {item['path']} (owner {item['owner']})")
 +
 +    if scope.get("violations"):
 +        print("Scope violations (changed but not declared in the plan):")
@@ -5502,7 +6444,7 @@ index 02eecc4..4268cc7 100755
 +    state here keeps a single writer per transition, so the caller's own
 +    ``state`` dict cannot overwrite a ``plan_file`` recorded from in here.
 +    """
-+    repo_root = Path.cwd()
++    checkout = repo_root()
 +    directory = task_dir(task_id)
 +    requirement_file = directory / "requirement.md"
 +
@@ -5524,7 +6466,7 @@ index 02eecc4..4268cc7 100755
 +    )
 +
 +    run_worker(
-+        codex_argv(repo_root, plan_file),
++        codex_argv(checkout, plan_file),
 +        CODEX_TIMEOUT_S,
 +        task_id=task_id,
 +        stdin_text=prompt,
@@ -5553,10 +6495,11 @@ index 02eecc4..4268cc7 100755
      )
  
      print(f"Codex replanned task {task_id}: {plan_file}")
+-    return 0
 +    return plan_file
-+
-+
-+def classify_failure(failure_reason: str) -> str:
+ 
+ 
+ def classify_failure(failure_reason: str) -> str:
 +    """Deterministic fallback classifier.
 +
 +    Kept as the fallback for when the classifier agent is unavailable, but note
@@ -5565,14 +6508,14 @@ index 02eecc4..4268cc7 100755
 +    prefixes. Every real failure lands on CLAUDE_FIX. That is why the LLM
 +    classifier below exists.
 +    """
-+    reason = failure_reason.lower()
-+
-+    if reason.startswith("architecture:"):
-+        return "CODEX_REPLAN"
-+
-+    if reason.startswith("requirement:"):
-+        return "DEVELOPER_CLARIFICATION"
-+
+     reason = failure_reason.lower()
+ 
+     if reason.startswith("architecture:"):
+@@ -495,7 +4574,391 @@ def classify_failure(failure_reason: str) -> str:
+     if reason.startswith("requirement:"):
+         return "DEVELOPER_CLARIFICATION"
+ 
+-    return "CLAUDE_FIX"
 +    return "CLAUDE_FIX"
 +
 +
@@ -5777,11 +6720,9 @@ index 02eecc4..4268cc7 100755
 +        f"  Reason: {reason}\n"
 +        f"  Task moved to REPLANNING; next: orchestrator.py {task_id} run"
 +    )
-     return 0
- 
- 
--def classify_failure(failure_reason: str) -> str:
--    reason = failure_reason.lower()
++    return 0
++
++
 +REPLAN_MAX_ATTEMPTS = 2
 +REPLAN_BUDGET_ENV = "ORCHESTRATOR_REPLAN_MAX_ATTEMPTS"
 +
@@ -5947,28 +6888,23 @@ index 02eecc4..4268cc7 100755
 +        save_state(state_path, state)
 +        record_event(task_id, "REPLAN_FAILED", detail="no usable plan produced")
 +        return 1
- 
--    if reason.startswith("architecture:"):
--        return "CODEX_REPLAN"
++
 +    state["plan_file"] = str(plan_file)
 +    state["status"] = "AWAITING_APPROVAL"
 +    save_state(state_path, state)
- 
--    if reason.startswith("requirement:"):
--        return "DEVELOPER_CLARIFICATION"
++
 +    record_event(
 +        task_id,
 +        "REPLAN_READY_FOR_APPROVAL",
 +        plan_version=state["plan_version"],
 +    )
- 
--    return "CLAUDE_FIX"
++
 +    print(f"Task {task_id} moved to AWAITING_APPROVAL.")
 +    return 0
  
  
  def route_failure(task_id: str) -> int:
-@@ -509,19 +4180,59 @@ def route_failure(task_id: str) -> int:
+@@ -509,53 +4972,271 @@ def route_failure(task_id: str) -> int:
          return 1
  
      reason = state.get("failure_reason") or "unspecified failure"
@@ -5997,7 +6933,8 @@ index 02eecc4..4268cc7 100755
 +        note=detail.get("note"),
      )
  
-+    if route == "CLAUDE_FIX":
+     if route == "CLAUDE_FIX":
+-        state["status"] = "IMPLEMENTING"
 +        # An approved plan authorises in-scope fixes under it, so this is not
 +        # gated on the version counter. It is gated on whether the plan the
 +        # worker would be handed is approved at all: with no approved plan
@@ -6027,17 +6964,22 @@ index 02eecc4..4268cc7 100755
 +            )
 +            route = replacement
 +
-     if route == "CLAUDE_FIX":
-         state["status"] = "IMPLEMENTING"
++    if route == "CLAUDE_FIX":
++        # The reason is already in FAILURE_ROUTED above, so clearing it here
++        # loses nothing and stops a resolved failure following the task around.
++        leave_failed(state, "IMPLEMENTING")
          save_state(state_path, state)
-@@ -529,33 +4240,207 @@ def route_failure(task_id: str) -> int:
+         record_event(task_id, "CLAUDE_FIX_STARTED", worker="claude")
          return 0
  
      if route == "CODEX_REPLAN":
-+        # Capture the failing plan before the version bump moves the pointer.
+-        state["status"] = "REPLANNING"
++        # Capture the failing plan and its reason before the version bump moves
++        # the pointer and before the reason is cleared: the replan prompt is
++        # built from this snapshot.
 +        failed_state = dict(state)
 +
-         state["status"] = "REPLANNING"
++        leave_failed(state, "REPLANNING")
          state["plan_version"] = state.get("plan_version", 1) + 1
          save_state(state_path, state)
  
@@ -6254,7 +7196,7 @@ index 02eecc4..4268cc7 100755
      return 0
  
  
-@@ -569,10 +4454,38 @@ def complete_task(task_id: str) -> int:
+@@ -569,10 +5250,38 @@ def complete_task(task_id: str) -> int:
          )
          return 1
  
@@ -6293,7 +7235,7 @@ index 02eecc4..4268cc7 100755
      )
  
      state["status"] = "COMPLETED"
-@@ -588,6 +4501,312 @@ def complete_task(task_id: str) -> int:
+@@ -588,6 +5297,321 @@ def complete_task(task_id: str) -> int:
      return 0
  
  
@@ -6557,10 +7499,19 @@ index 02eecc4..4268cc7 100755
 +
 +        if status == "IMPLEMENTING":
 +            if not has_event(task_id, "CLAUDE_FIX_STARTED"):
++                # Still a deliberate stop: `run` does not self-heal, because a
++                # driver that resumed an interrupted implementation on its own
++                # would be guessing at what the killed worker had finished.
++                # It now names the verb that does the closing, instead of
++                # leaving the developer with state.json and a text editor.
 +                print(
 +                    f"ERROR: TASK {task_id} is IMPLEMENTING with no routed "
-+                    "failure. A previous run was interrupted; inspect the task "
-+                    "before continuing."
++                    "failure. A previous run was interrupted, and `run` will "
++                    "not resume it on its own.\n"
++                    f"  Close it out with: orchestrator.py {task_id} recover "
++                    '"<what interrupted it>"\n'
++                    "  That records the interruption and moves the task to "
++                    "FAILED, which route-failure can classify."
 +                )
 +                return 1
 +
@@ -6606,7 +7557,7 @@ index 02eecc4..4268cc7 100755
  def show_status(task_id: str) -> int:
      _, state = load_state(task_id)
      current = state["status"]
-@@ -604,47 +4823,393 @@ def show_status(task_id: str) -> int:
+@@ -604,47 +5628,466 @@ def show_status(task_id: str) -> int:
      return 0
  
  
@@ -6891,12 +7842,58 @@ index 02eecc4..4268cc7 100755
 +    "run": run_driver,
 +}
 +
++# Verbs that take a trailing text argument the developer supplies.
++TEXT_ACTIONS = {
++    "reject": reject_plan,
++    "recover": run_recover,
++}
++
++# Read-only verbs. They must stay usable while another invocation holds the
++# lock, so they never take one.
++READ_ONLY_ACTIONS = ("status", "context", "cost")
++
++# Verbs dispatched without the per-task lock. `recover`'s entire subject is a
++# lock an interrupted run left behind, so taking one would create the very
++# condition it has to refuse on and mask the one it was called about.
++UNLOCKED_ACTIONS = frozenset(READ_ONLY_ACTIONS + ("recover",))
++
++# Actions that take no task id at all.
++REPO_LEVEL_VERBS = ("preflight", "new", "adr")
++
++# Verbs whose status gate accepts IMPLEMENTING. `fix` advances a routed
++# failure; `recover` closes an interrupted attempt. Anything else refuses,
++# which is what made the interrupted case a dead end when only `fix` existed.
++IMPLEMENTING_EXITS = ("fix", "recover")
++
++
++def resolve_handler(handler):
++    """The handler as it exists now, not as it was when the table was built.
++
++    A dispatch table captures function objects at import time, so a test (or a
++    caller) that replaces the module attribute would find the table still
++    pointing at the original. Looking the name up again keeps the table honest
++    about what will actually run.
++    """
++    return globals().get(handler.__name__, handler)
++
++
++def dispatchable_verbs() -> set:
++    """Every verb the CLI accepts. The documented list must equal this."""
++    return (
++        set(ACTIONS)
++        | set(TEXT_ACTIONS)
++        | set(READ_ONLY_ACTIONS)
++        | set(REPO_LEVEL_VERBS)
++    )
++
++
 +USAGE = """Usage:
 +  orchestrator.py preflight
 +  orchestrator.py new "<requirement text>"
 +  orchestrator.py adr "<decision title>"
 +  orchestrator.py TASK-XXX <action>
 +  orchestrator.py TASK-XXX reject "<reason>"
++  orchestrator.py TASK-XXX recover "<what interrupted the run>"
 +
 +Repo-level:
 +  preflight       check every precondition for a real run: both worker CLIs
@@ -6917,6 +7914,11 @@ index 02eecc4..4268cc7 100755
 +                  back for a replan (needs a reason; the replanner is shown it)
 +  implement       invoke the implementation worker
 +  fix             re-invoke the implementer on a routed failure
++  recover         close out an implementation attempt that was interrupted
++                  (needs a reason; refuses unless the trail shows an
++                  unterminated attempt, and fail-closed on a leftover lock
++                  unless ORCHESTRATOR_RECOVER_LOCK_OVERRIDE names the
++                  developer asserting it is stale)
 +  validate        run validation and record evidence
 +  review          build the developer review package
 +  route-failure   classify and route a failure
@@ -6938,11 +7940,18 @@ index 02eecc4..4268cc7 100755
 +            print(f"ERROR: {exc}")
 +            return 1
 +
-+    # `reject` carries the developer's reason, which the replanner is shown.
-+    if len(sys.argv) == 4 and sys.argv[2] == "reject":
++    # Verbs carrying a developer-supplied reason: `reject`, which the replanner
++    # is shown, and `recover`, which records what interrupted a run.
++    if len(sys.argv) == 4 and sys.argv[2] in TEXT_ACTIONS:
++        task_id, action, text = sys.argv[1], sys.argv[2], sys.argv[3]
++        handler = resolve_handler(TEXT_ACTIONS[action])
++
 +        try:
-+            with task_lock(sys.argv[1]):
-+                return reject_plan(sys.argv[1], sys.argv[3])
++            if action in UNLOCKED_ACTIONS:
++                return handler(task_id, text)
++
++            with task_lock(task_id):
++                return handler(task_id, text)
 +        except (
 +            FileNotFoundError,
 +            RuntimeError,
@@ -6960,6 +7969,21 @@ index 02eecc4..4268cc7 100755
 +
 +            return run_adr(sys.argv[2])
 +        except (FileNotFoundError, RuntimeError, OSError) as exc:
++            print(f"ERROR: {exc}")
++            return 1
++
++    # `recover` without a reason still has to reach its own handler, which
++    # explains what is missing. Falling through to USAGE would leave the
++    # developer guessing at an argument the verb requires.
++    if len(sys.argv) == 3 and sys.argv[2] in TEXT_ACTIONS:
++        try:
++            return resolve_handler(TEXT_ACTIONS[sys.argv[2]])(sys.argv[1], "")
++        except (
++            FileNotFoundError,
++            RuntimeError,
++            json.JSONDecodeError,
++            OSError,
++        ) as exc:
 +            print(f"ERROR: {exc}")
 +            return 1
 +
@@ -7013,7 +8037,7 @@ index 02eecc4..4268cc7 100755
 -        print(f"Unknown action: {action}")
 -        return 2
 +        with task_lock(task_id):
-+            return handler(task_id)
++            return resolve_handler(handler)(task_id)
  
 -    except (FileNotFoundError, RuntimeError, json.JSONDecodeError) as exc:
 +    except (
@@ -8223,7 +9247,7 @@ index 0f84bb5..c4f3c43 100644
  ## Important
  
 diff --git a/CLAUDE.md b/CLAUDE.md
-index 650ef42..629ea19 100644
+index 650ef42..da3099a 100644
 --- a/CLAUDE.md
 +++ b/CLAUDE.md
 @@ -7,12 +7,34 @@
@@ -8261,7 +9285,7 @@ index 650ef42..629ea19 100644
  
  ## Workflow
  
-@@ -20,3 +42,189 @@
+@@ -20,3 +42,258 @@
  - Implement only after the implementation plan has been approved.
  - Keep changes scoped to the current task.
  - Run tests after implementation.
@@ -8311,6 +9335,12 @@ index 650ef42..629ea19 100644
 +- `.ai/tasks/*/test-results.json`
 +- `.ai/tasks/*/validation.md`
 +- `.ai/tasks/*/review-findings.json`
++- `.ai/tasks/*/critique-<plan-stem>-round-<round>.json`
++
++The last one is a read-only checker's verdict on a plan, which is why it is in
++this tier rather than merely conventional: a worker able to author a critique
++could hand the developer a critique nothing criticised. The guard matches the
++whole naming family, not one example of it.
 +
 +Workflow **infrastructure** — `.ai/scripts/`, `.ai/schemas/`, `.ai/hooks/`,
 +`.claude/settings.json` — is writable by a worker only when the approved plan
@@ -8324,9 +9354,9 @@ index 650ef42..629ea19 100644
 +## Verbs
 +
 +```
-+preflight | new | adr | status | context | run | clarify | advance | plan |
-+approve | implement | fix | validate | review | route-failure | worktree | pr |
-+complete
++preflight | new | adr | status | context | cost | run | clarify | advance |
++plan | approve | reject | implement | fix | recover | validate | review |
++route-failure | replan | worktree | pr | complete
 +```
 +
 +- `preflight` checks every precondition for a real run and executes what it
@@ -8339,15 +9369,69 @@ index 650ef42..629ea19 100644
 +  refuses to leave `ANALYZING` while any answer is missing.
 +- `run` advances until an approval gate, a terminal state, or a failure.
 +  Idempotent; safe to re-run from any state.
-+- `fix` is the legal exit from `IMPLEMENTING` after `route-failure` has recorded
-+  a `CLAUDE_FIX_STARTED` event. It re-invokes the implementer with the failure
-+  evidence attached. When fixing: fix the cause, and never weaken or delete
-+  tests to make them pass.
++- `IMPLEMENTING` exits: `fix` | `recover`. Nothing else accepts that state.
++- `fix` handles the routed-failure entry into `IMPLEMENTING`, after
++  `route-failure` has recorded a `CLAUDE_FIX_STARTED` event. It re-invokes the
++  implementer with the failure evidence attached. When fixing: fix the cause,
++  and never weaken or delete tests to make them pass.
++- `recover` handles the other entry: an `implement` run killed between
++  `IMPLEMENTATION_STARTED` and its outcome. It takes a reason, records the
++  interruption as an attributable human assertion, and moves the task to
++  `FAILED`, which `route-failure` then classifies. It does not resume, re-run,
++  validate or complete anything, and it never touches the work on disk — a
++  recovered task still reaches `VALIDATED` only by running validation.
++  It is fail-closed: it refuses a task that is not `IMPLEMENTING`, one whose
++  attempt already has a terminating event, one already carrying
++  `CLAUDE_FIX_STARTED`, and any task with a `.lock` unless
++  `ORCHESTRATOR_RECOVER_LOCK_OVERRIDE` names the developer asserting the lock
++  is stale. A recorded pid is advisory detail in the event and never
++  authorisation: `os.kill(pid, 0)` is unsafe on Windows, where Python maps a
++  non-CTRL signal to `TerminateProcess`.
 +- `pr` is opt-in (`ORCHESTRATOR_ENABLE_PR=1`) because it pushes the branch.
 +- `complete` is blocked while CI is failing or pending.
 +
-+Mutating verbs take a per-task lock. `status` does not, so it stays readable
-+while another invocation is running.
++Mutating verbs take a per-task lock. `status`, `context` and `cost` do not, so
++they stay readable while another invocation is running — and neither does
++`recover`, whose whole subject is a lock an interrupted run left behind.
++
++## A task's worktree is where its work happens
++
++`worktree` creates the tree and records it in `state.worktree`. That record is
++now read: a task's worker subprocesses, acceptance commands, validation checks,
++task-delta manifests and git corroboration are all rooted in the recorded
++worktree. A task whose `worktree` is null — every task that predates this —
++falls back to the orchestrator checkout, which is also the fallback for a
++recorded path that is no longer a directory.
++
++Evidence stays single-homed in the orchestrator checkout. Two consequences:
++
++- `.claude/settings.json` registers hooks as cwd-relative commands, so the hook
++  code that **executes** is the recorded worktree's copy. That is deliberate:
++  the worker's own tree is what a cwd-relative command names.
++- That copy reads the authoritative blackboard, constitution, approved plan and
++  Stop evidence from absolute paths the orchestrator exports —
++  `ORCHESTRATOR_REPO_ROOT`, `ORCHESTRATOR_TASK_DIR`,
++  `ORCHESTRATOR_CONSTITUTION`, `ORCHESTRATOR_WORKER_ROOT`. Without them a
++  worktree copy would inject an empty blackboard, check the Stop guard against
++  the wrong notes, and authorise writes against the wrong plan. Resolution
++  falls back to cwd when they are absent, so a session the orchestrator did not
++  launch is unaffected.
++
++`committed_changed` starts at the commit the baseline recorded, not at
++merge-base(`main`, HEAD). On a branch several commits ahead the fork point
++listed everything the branch had ever carried — 74 files for TASK-007, none of
++which that task produced. A baseline with no recorded `git.head` gets no
++committed evidence at all; omitting it is honest, substituting a different base
++is not.
++
++A path that structurally belongs to another **open** task — under its recorded
++worktree, or under its `.ai/tasks/<id>/` — is recorded in a non-blocking
++`foreign` list rather than counted as this task's scope violation. Ownership is
++structural only: another task's plan is never read, because that would make one
++task's plan an authorisation input for another task's validation. The residual
++case is known and accepted: a concurrent open task with no recorded worktree
++that edits shared source is not structurally attributable, and still lands in
++this task's delta as a violation.
 +
 +## The plan is a contract, not a document
 +
@@ -8365,6 +9449,15 @@ index 650ef42..629ea19 100644
 +
 +So declare every file you will touch, and do not treat an unverifiable
 +criterion as satisfied.
++
++Each completed critique round is persisted to
++`.ai/tasks/<task-id>/critique-<plan-stem>-round-<round>.json`, carrying the
++critic's issue text and severities, the plan version and the round. When the
++critic still objects after its last round, that file is the one to read before
++approving; because the name identifies both the plan and the round, a stale
++round cannot masquerade as the current one. It used to be counted and not
++recorded — the issue text went to stdout and nowhere else, so a developer told
++two blocking issues existed had no way to read them.
 +
 +## A task must show it produced the change
 +
@@ -10862,10 +11955,10 @@ index 0000000..dea2dac
 +    unittest.main()
 diff --git a/test_context_bus.py b/test_context_bus.py
 new file mode 100644
-index 0000000..ca0e702
+index 0000000..f9a7ffb
 --- /dev/null
 +++ b/test_context_bus.py
-@@ -0,0 +1,662 @@
+@@ -0,0 +1,929 @@
 +"""Phase 3 - the context bus: blackboard, hooks, replan context, cross-task memory.
 +
 +The audit's finding: there is no shared context, only one-directional file
@@ -10876,6 +11969,7 @@ index 0000000..ca0e702
 +
 +import json
 +import os
++import shutil
 +import subprocess
 +import sys
 +import unittest
@@ -11455,6 +12549,272 @@ index 0000000..ca0e702
 +        self.assertEqual(result.returncode, 0)
 +
 +
++class WorktreeHookCase(TaskDirCase):
++    """A checkout and a recorded worktree, with the hooks in both.
++
++    ``.claude/settings.json`` registers hooks as cwd-relative commands, so once
++    a worker's cwd is its recorded worktree the scripts that execute are *that
++    worktree's* copies. The evidence they must read is not there: the
++    blackboard, the constitution, ``implementation.md`` and the approved plan
++    are single-homed in the orchestrator checkout.
++    """
++
++    CHECKOUT_MARKER = "HOOK-COPY-CHECKOUT"
++    WORKTREE_MARKER = "HOOK-COPY-WORKTREE"
++    HOOK_SCRIPTS = ("session_start.py", "stop_guard.py")
++
++    def setUp(self):
++        super().setUp()
++
++        self.checkout = self.tmp
++        self.worktree = self.tmp / ".worktrees" / self.task_id
++        self.worktree.mkdir(parents=True)
++
++        self._install_hooks(self.checkout, self.CHECKOUT_MARKER)
++        self._install_hooks(self.worktree, self.WORKTREE_MARKER)
++
++        (self.checkout / ".ai" / "constitution.md").write_text(
++            "# Project constitution\n\nSENTINEL_CONSTITUTION\n", encoding="utf-8"
++        )
++        # A decoy in the worktree: everything a cwd-resolving hook would read,
++        # placed where reading it would be wrong.
++        self.decoy = self.worktree / ".ai" / "tasks" / self.task_id
++        self.decoy.mkdir(parents=True)
++        (self.decoy / "context.jsonl").write_text(
++            json.dumps(
++                {
++                    "block_id": "ctx-001",
++                    "type": "decision",
++                    "author": "claude",
++                    "phase": "IMPLEMENTING",
++                    "content": "DECOY_BLOCK_CONTENT",
++                }
++            )
++            + "\n",
++            encoding="utf-8",
++        )
++        (self.decoy / "implementation.md").write_text(
++            "decoy notes\n", encoding="utf-8"
++        )
++        (self.worktree / ".ai" / "constitution.md").write_text(
++            "DECOY_CONSTITUTION\n", encoding="utf-8"
++        )
++
++        self.write_state(
++            status="IMPLEMENTING", worktree=".worktrees/%s" % self.task_id
++        )
++
++    def _install_hooks(self, root, marker):
++        """Copy the real hooks in, made distinguishable by which copy ran.
++
++        The marker goes to stderr from inside ``main()``, so the hook's own
++        stdout contract -- what SessionStart injects -- is untouched.
++        """
++        directory = root / ".ai" / "hooks"
++        directory.mkdir(parents=True, exist_ok=True)
++        shutil.copy2(HOOKS / "run", directory / "run")
++
++        for name in self.HOOK_SCRIPTS:
++            source = (HOOKS / name).read_text(encoding="utf-8")
++            marked = source.replace(
++                "def main():",
++                'def main():\n    sys.stderr.write("%s\\n")' % marker,
++                1,
++            )
++
++            self.assertIn(marker, marked, name)
++            (directory / name).write_text(marked, encoding="utf-8")
++
++    def _env(self, **overrides):
++        """A clean environment: no ORCHESTRATOR_* the caller did not ask for.
++
++        Necessary rather than tidy. These hooks read authoritative roots out of
++        the environment, so a suite run *inside* an orchestrated worker session
++        would otherwise inherit that session's roots and read the real
++        repository's evidence instead of the fixture's.
++        """
++        environment = {
++            key: value
++            for key, value in os.environ.items()
++            if not key.startswith("ORCHESTRATOR_")
++        }
++        environment.update(
++            {key: value for key, value in overrides.items() if value is not None}
++        )
++        return environment
++
++    def _authoritative_env(self):
++        """What ``worker_env`` exports for this task, built by the real thing."""
++        return self._env(**orch.worker_env(self.task_id))
++
++
++class WorktreeHookBehaviourTests(WorktreeHookCase):
++    def _run(self, script, cwd, env):
++        return subprocess.run(
++            [sys.executable, str(HOOKS / script)],
++            cwd=str(cwd),
++            capture_output=True,
++            text=True,
++            env=env,
++        )
++
++    def test_hooks_use_authoritative_task_directory(self):
++        orch.append_context_block(
++            self.task_id,
++            "codex",
++            "PLANNING",
++            "repo_finding",
++            "AUTHORITATIVE_BLOCK_CONTENT",
++        )
++        env = self._authoritative_env()
++
++        injected = self._run("session_start.py", self.worktree, env)
++
++        self.assertEqual(injected.returncode, 0)
++        self.assertIn("AUTHORITATIVE_BLOCK_CONTENT", injected.stdout)
++        self.assertIn("SENTINEL_CONSTITUTION", injected.stdout)
++        # The worktree's own copy of both would have been the wrong answer.
++        self.assertNotIn("DECOY_BLOCK_CONTENT", injected.stdout)
++        self.assertNotIn("DECOY_CONSTITUTION", injected.stdout)
++
++        # The Stop guard checks the checkout's notes, not the worktree's decoy
++        # -- otherwise a worker rooted elsewhere passes a guard it never met.
++        blocked = self._run("stop_guard.py", self.worktree, env)
++
++        self.assertEqual(blocked.returncode, 2)
++        self.assertIn("implementation.md", blocked.stderr)
++
++        (self.task_path / "implementation.md").write_text("real notes\n")
++        orch.append_context_block(
++            self.task_id, "claude", "IMPLEMENTING", "deviation", "recorded"
++        )
++
++        allowed = self._run("stop_guard.py", self.worktree, env)
++
++        self.assertEqual(allowed.returncode, 0)
++
++    def test_hooks_retain_legacy_cwd_fallback(self):
++        """A session the orchestrator did not launch still works.
++
++        Only the task id is exported, which is the shape every session had
++        before the authoritative roots existed.
++        """
++        orch.append_context_block(
++            self.task_id,
++            "codex",
++            "PLANNING",
++            "repo_finding",
++            "LEGACY_BLOCK_CONTENT",
++        )
++        env = self._env(ORCHESTRATOR_TASK_ID=self.task_id)
++
++        injected = self._run("session_start.py", self.checkout, env)
++
++        self.assertEqual(injected.returncode, 0)
++        self.assertIn("LEGACY_BLOCK_CONTENT", injected.stdout)
++        self.assertIn("SENTINEL_CONSTITUTION", injected.stdout)
++
++        blocked = self._run("stop_guard.py", self.checkout, env)
++
++        self.assertEqual(blocked.returncode, 2)
++
++        (self.task_path / "implementation.md").write_text("notes\n")
++        orch.append_context_block(
++            self.task_id, "claude", "IMPLEMENTING", "decision", "x"
++        )
++
++        self.assertEqual(
++            self._run("stop_guard.py", self.checkout, env).returncode, 0
++        )
++
++
++@unittest.skipUnless(shutil.which("bash"), "bash not available")
++class WorktreeHookCopyAuthorityTests(WorktreeHookCase):
++    """Which copy executes is a decision, so it is asserted rather than assumed.
++
++    The recorded worktree's copy is authoritative *code*; the orchestrator
++    checkout is authoritative *evidence*. Both halves are checked here, through
++    the real cwd-relative command from ``.claude/settings.json`` -- running the
++    script by absolute path would prove nothing about what the harness does.
++    """
++
++    def _registered_command(self, event):
++        settings = json.loads(
++            (REPO_ROOT / ".claude" / "settings.json").read_text(
++                encoding="utf-8"
++            )
++        )
++        commands = [
++            hook["command"]
++            for entry in settings["hooks"][event]
++            for hook in entry["hooks"]
++        ]
++
++        self.assertEqual(len(commands), 1, commands)
++        argv = commands[0].split()
++
++        self.assertEqual(argv[0], "bash", commands[0])
++        # Relative, which is exactly why the worktree's copy is the one that
++        # runs: the harness resolves it against the worker's cwd.
++        for token in argv[1:]:
++            self.assertFalse(Path(token).is_absolute(), token)
++
++        return [shutil.which("bash")] + argv[1:]
++
++    def _launch(self, event, env):
++        return subprocess.run(
++            self._registered_command(event),
++            cwd=str(self.worktree),
++            capture_output=True,
++            text=True,
++            env=env,
++        )
++
++    def test_recorded_worktree_hook_copy_executes_with_orchestrator_evidence(
++        self,
++    ):
++        orch.append_context_block(
++            self.task_id,
++            "codex",
++            "PLANNING",
++            "repo_finding",
++            "AUTHORITATIVE_BLOCK_CONTENT",
++        )
++        env = self._authoritative_env()
++
++        injected = self._launch("SessionStart", env)
++
++        self.assertEqual(injected.returncode, 0, injected.stderr)
++        # The code that ran belongs to the worktree.
++        self.assertIn(self.WORKTREE_MARKER, injected.stderr)
++        self.assertNotIn(self.CHECKOUT_MARKER, injected.stderr)
++        # The evidence it read belongs to the checkout.
++        self.assertIn("AUTHORITATIVE_BLOCK_CONTENT", injected.stdout)
++        self.assertIn("SENTINEL_CONSTITUTION", injected.stdout)
++        self.assertNotIn("DECOY_BLOCK_CONTENT", injected.stdout)
++        self.assertNotIn("DECOY_CONSTITUTION", injected.stdout)
++
++        blocked = self._launch("Stop", env)
++
++        self.assertEqual(blocked.returncode, 2)
++        self.assertIn(self.WORKTREE_MARKER, blocked.stderr)
++        self.assertNotIn(self.CHECKOUT_MARKER, blocked.stderr)
++        # The worktree's decoy implementation.md and blackboard would have
++        # satisfied both obligations. The guard is not looking there.
++        self.assertIn("implementation.md", blocked.stderr)
++        self.assertIn(str(self.task_path.resolve()), blocked.stderr)
++
++        (self.task_path / "implementation.md").write_text("real notes\n")
++        orch.append_context_block(
++            self.task_id, "claude", "IMPLEMENTING", "deviation", "recorded"
++        )
++
++        allowed = self._launch("Stop", env)
++
++        self.assertEqual(allowed.returncode, 0)
++        self.assertIn(self.WORKTREE_MARKER, allowed.stderr)
++
++
 +class SettingsTests(unittest.TestCase):
 +    def test_settings_registers_both_hooks(self):
 +        settings = json.loads(
@@ -11973,10 +13333,10 @@ index 0000000..ef6a6b8
 +    unittest.main()
 diff --git a/test_fix_loop.py b/test_fix_loop.py
 new file mode 100644
-index 0000000..81bfc3b
+index 0000000..313e9c0
 --- /dev/null
 +++ b/test_fix_loop.py
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,363 @@
 +"""Fix B3 / audit 2.4 - a task in IMPLEMENTING has a legal next action.
 +
 +``route_failure`` set status IMPLEMENTING and emitted CLAUDE_FIX_STARTED, but
@@ -11989,7 +13349,13 @@ index 0000000..81bfc3b
 +import unittest
 +from unittest import mock
 +
-+from _support import TaskDirCase, load_orchestrator, plan_json, quiet
++from _support import (
++    TaskDirCase,
++    load_orchestrator,
++    plan_json,
++    quiet,
++    worker_name,
++)
 +
 +orch = load_orchestrator()
 +
@@ -12178,14 +13544,168 @@ index 0000000..81bfc3b
 +        self.assertTrue(orch.has_event(self.task_id, "CLAUDE_FIX_STARTED"))
 +
 +
++class FailureReasonLifecycleTests(TaskDirCase):
++    """A resolved failure must not follow the task around.
++
++    TASK-007's state.json carried ``fix-precondition: plan_rejected`` from a
++    superseded routing decision while its status was IMPLEMENTING and its
++    approval gate had passed: every later prompt and report read a live failure
++    that no longer existed. The reason belongs in the append-only trail, which
++    is why clearing it from the live state loses nothing.
++    """
++
++    REASON = "Validation command failed with exit code 1"
++
++    def _reset(self):
++        """Clear the task's evidence so the next route starts from FAILED."""
++        for child in sorted(self.task_path.iterdir()):
++            if child.is_file():
++                child.unlink()
++
++    def _failed(self, **overrides):
++        self.write_requirement()
++        self.write_plan("plan.json", PLAN)
++        self.write_state(status="AWAITING_APPROVAL")
++
++        with quiet():
++            orch.approve_plan(self.task_id)
++
++        self.write_state(
++            status="FAILED", failure_reason=self.REASON, **overrides
++        )
++
++    def _route(self, route):
++        """Route a FAILED task, with both workers doubled."""
++
++        def fake_run(argv, **kwargs):
++            if worker_name(argv) == "claude":
++                return mock.Mock(
++                    returncode=0,
++                    stdout=json.dumps({"verdict": "pass", "issues": []}),
++                    stderr="",
++                )
++
++            out = argv[argv.index("--output-last-message") + 1]
++            orch.Path(out).write_text(plan_json(), encoding="utf-8")
++            return mock.Mock(returncode=0, stdout="", stderr="")
++
++        with mock.patch.object(
++            orch,
++            "classify_failure_with_agent",
++            return_value=(route, {"source": "test"}),
++        ), mock.patch.object(orch.subprocess, "run", side_effect=fake_run):
++            with quiet() as out:
++                code = orch.route_failure(self.task_id)
++
++        return code, out.getvalue()
++
++    def test_failure_reason_is_cleared_on_every_exit_from_failed(self):
++        """Each route that leaves FAILED, and the one that does not.
++
++        Enumerated against ``FAILURE_ROUTES`` rather than against a list this
++        test happens to know, so a route added later cannot slip past with no
++        assertion about the reason it leaves behind.
++        """
++        self.assertEqual(
++            set(orch.FAILURE_ROUTES),
++            {"CLAUDE_FIX", "CODEX_REPLAN", "DEVELOPER_CLARIFICATION"},
++            "a new failure route needs its own failure_reason assertion here",
++        )
++
++        exits = {"CLAUDE_FIX": "IMPLEMENTING", "CODEX_REPLAN": "AWAITING_APPROVAL"}
++
++        for route, expected in exits.items():
++            with self.subTest(route=route):
++                self._reset()
++                self._failed()
++
++                code, _ = self._route(route)
++                state = self.read_state()
++
++                self.assertEqual(code, 0)
++                self.assertEqual(state["status"], expected)
++                self.assertNotEqual(state["status"], "FAILED")
++                self.assertIsNone(
++                    state["failure_reason"],
++                    "%s left the failure reason on a task that is no longer "
++                    "failed" % route,
++                )
++                # Nothing was lost: the reason is in the append-only trail, and
++                # the prompt builders read it from there.
++                routed = [
++                    e for e in self.events() if e["event"] == "FAILURE_ROUTED"
++                ]
++                self.assertEqual(routed[-1]["failure_reason"], self.REASON)
++                self.assertEqual(
++                    orch.last_recorded_failure_reason(self.task_id),
++                    self.REASON,
++                )
++
++        # DEVELOPER_CLARIFICATION is not an exit: the task stays FAILED, so its
++        # reason is still live and must survive.
++        self._reset()
++        self._failed()
++        self._route("DEVELOPER_CLARIFICATION")
++
++        held = self.read_state()
++        self.assertEqual(held["status"], "FAILED")
++        self.assertEqual(held["failure_reason"], self.REASON)
++
++    def test_the_fix_prompt_still_has_the_reason_after_clearing(self):
++        """Clearing must not cost the fix worker its evidence.
++
++        ``run_fix`` builds its prompt after routing has already cleared the
++        live field, so the evidence has to come out of the trail.
++        """
++        self._failed()
++        self.write_baseline()
++        self._route("CLAUDE_FIX")
++
++        self.assertIsNone(self.read_state()["failure_reason"])
++
++        _, state = orch.load_state(self.task_id)
++
++        self.assertIn(self.REASON, orch.failure_evidence(self.task_id, state))
++
++    def test_a_replan_records_the_reason_before_clearing_it(self):
++        """The replan prompt is built from the pre-clear snapshot."""
++        self._failed()
++
++        captured = {}
++
++        def fake_run(argv, **kwargs):
++            if worker_name(argv) == "claude":
++                return mock.Mock(
++                    returncode=0,
++                    stdout=json.dumps({"verdict": "pass", "issues": []}),
++                    stderr="",
++                )
++
++            captured["prompt"] = kwargs.get("input")
++            out = argv[argv.index("--output-last-message") + 1]
++            orch.Path(out).write_text(plan_json(), encoding="utf-8")
++            return mock.Mock(returncode=0, stdout="", stderr="")
++
++        with mock.patch.object(
++            orch,
++            "classify_failure_with_agent",
++            return_value=("CODEX_REPLAN", {"source": "test"}),
++        ), mock.patch.object(orch.subprocess, "run", side_effect=fake_run):
++            with quiet():
++                orch.route_failure(self.task_id)
++
++        self.assertIsNone(self.read_state()["failure_reason"])
++        self.assertIn(self.REASON, captured["prompt"])
++
++
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/test_hardening.py b/test_hardening.py
 new file mode 100644
-index 0000000..6ec835e
+index 0000000..715252f
 --- /dev/null
 +++ b/test_hardening.py
-@@ -0,0 +1,597 @@
+@@ -0,0 +1,948 @@
 +"""Phase 4 - hooks as controls, sandbox boundary, cost accounting.
 +
 +Everything CLAUDE.md previously *asked* for -- do not write state.json, do not
@@ -12193,8 +13713,11 @@ index 0000000..6ec835e
 +a control, and starts recording what a task actually cost.
 +"""
 +
++import importlib.util
 +import json
 +import os
++import re
++import shutil
 +import subprocess
 +import sys
 +import unittest
@@ -12205,6 +13728,7 @@ index 0000000..6ec835e
 +    REPO_ROOT,
 +    TaskDirCase,
 +    load_orchestrator,
++    plan_json,
 +    quiet,
 +    worker_name,
 +)
@@ -12773,6 +14297,353 @@ index 0000000..6ec835e
 +        self.assertIn("Unknown, not zero", text)
 +
 +
++def load_guard():
++    """Import the hook as a module, to read the patterns it enforces with.
++
++    The hook is a script; importing it is only for reading its constants, and
++    every behavioural assertion below still runs it as a subprocess.
++    """
++    spec = importlib.util.spec_from_file_location(
++        "workflow_pre_tool_use", HOOKS / "pre_tool_use.py"
++    )
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++
++    return module
++
++
++def documented_evidence_paths():
++    """The orchestrator-owned artifact list, parsed out of CLAUDE.md.
++
++    Parsed rather than grepped: what has to agree with the guard is the list
++    the developer is shown, so the list is what gets read.
++    """
++    text = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
++    heading = "## Orchestrator-owned artifacts"
++    start = text.find(heading)
++
++    if start < 0:
++        raise AssertionError("CLAUDE.md has no %r section" % heading)
++
++    section = text[start + len(heading):]
++    end = section.find("\n## ")
++    section = section if end < 0 else section[:end]
++    found = []
++
++    for line in section.splitlines():
++        match = re.match(r"^- `([^`]+)`\s*$", line.strip())
++
++        if match:
++            found.append(match.group(1))
++
++    if not found:
++        raise AssertionError("CLAUDE.md lists no orchestrator-owned artifacts")
++
++    return found
++
++
++def documented_pattern(documented):
++    """A documented path convention, as a matcher.
++
++    ``*`` is a path segment, ``<placeholder>`` is whatever the placeholder
++    names -- a round is digits, anything else is a segment. Translating the
++    documentation into a matcher is what makes "the same convention" a
++    checkable claim rather than two texts that happen to look alike.
++    """
++    out = []
++
++    for token in re.split(r"(\*|<[^>]+>)", documented):
++        if token == "*":
++            out.append(r"[^/]+")
++        elif token.startswith("<") and token.endswith(">"):
++            out.append(r"[0-9]+" if "round" in token else r"[^/]+")
++        else:
++            out.append(re.escape(token))
++
++    return re.compile("^" + "".join(out) + "$")
++
++
++class ProtectedCritiqueEvidenceTests(TaskDirCase):
++    """A persisted critique is a read-only checker's verdict on a plan.
++
++    Calling it orchestrator-owned in a plan constraint while the guard did not
++    list it would ship a new evidence file a worker can write its own version
++    of -- against the rule that no plan can authorise a worker to write its own
++    verdict.
++    """
++
++    CRITIQUE = "critique-plan-round-1.json"
++
++    def _approved_plan_declaring(self, *paths):
++        self.write_requirement()
++        self.write_plan(
++            "plan.json",
++            plan_json(
++                files_to_create=[
++                    {"path": path, "purpose": "declared"} for path in paths
++                ]
++            ),
++        )
++        self.write_state(status="AWAITING_APPROVAL")
++
++        with quiet():
++            orch.approve_plan(self.task_id)
++
++    def _write(self, path):
++        environment = {
++            key: value
++            for key, value in os.environ.items()
++            if not key.startswith("ORCHESTRATOR_")
++        }
++        environment["ORCHESTRATOR_TASK_ID"] = self.task_id
++
++        return subprocess.run(
++            [sys.executable, str(HOOKS / "pre_tool_use.py")],
++            input=json.dumps(
++                {"tool_name": "Write", "tool_input": {"file_path": path}}
++            ),
++            cwd=str(self.tmp),
++            capture_output=True,
++            text=True,
++            env=environment,
++        )
++
++    def test_worker_write_to_critique_artifact_is_denied(self):
++        artifact = ".ai/tasks/%s/%s" % (self.task_id, self.CRITIQUE)
++        # Declared in the plan the developer approved, which is the case that
++        # has to be denied: the tier exists because no plan can authorise it.
++        self._approved_plan_declaring(artifact, ".ai/schemas/new.schema.json")
++
++        denied = self._write(artifact)
++
++        self.assertEqual(denied.returncode, DENY)
++        self.assertIn("orchestrator-owned", denied.stderr)
++
++        # The plan really is being read -- an infrastructure file declared in
++        # the same plan is allowed -- so the denial above is about the tier and
++        # not about a plan the hook failed to find.
++        allowed = self._write(".ai/schemas/new.schema.json")
++
++        self.assertEqual(allowed.returncode, ALLOW, allowed.stderr)
++
++    def test_the_whole_critique_naming_family_is_denied(self):
++        """A guard matching one example would leave the real artifact open.
++
++        The file the developer reads at the approval gate is the last round of
++        the current plan version, so a pattern pinned to
++        ``critique-plan-round-1.json`` would protect the one nobody reads.
++        """
++        self._approved_plan_declaring("widget.py")
++
++        for name in (
++            "critique-plan-round-1.json",
++            "critique-plan-round-2.json",
++            "critique-plan-v4-round-2.json",
++            "critique-plan-v12-round-11.json",
++        ):
++            with self.subTest(name):
++                result = self._write(
++                    ".ai/tasks/%s/%s" % (self.task_id, name)
++                )
++
++                self.assertEqual(result.returncode, DENY)
++                self.assertIn("orchestrator-owned", result.stderr)
++
++    def test_an_absolute_path_to_a_critique_is_denied(self):
++        self._approved_plan_declaring("widget.py")
++        target = self.task_path.resolve() / self.CRITIQUE
++
++        result = self._write(str(target))
++
++        self.assertEqual(result.returncode, DENY)
++
++    def test_documented_critique_pattern_matches_guard_contract(self):
++        """CLAUDE.md's convention and the executed guard, compared on paths."""
++        documented = documented_evidence_paths()
++        guard = load_guard()
++
++        # Every artifact CLAUDE.md calls orchestrator-owned is denied, using
++        # the documented convention to build the path.
++        self._approved_plan_declaring("widget.py")
++
++        for entry in documented:
++            concrete = (
++                entry.replace("*", self.task_id)
++                .replace("<plan-stem>", "plan-v4")
++                .replace("<round>", "2")
++            )
++
++            with self.subTest(entry):
++                self.assertNotIn("<", concrete)
++                result = self._write(concrete)
++
++                self.assertEqual(result.returncode, DENY, concrete)
++                self.assertIn("orchestrator-owned", result.stderr)
++
++        # And the critique convention CLAUDE.md documents decides exactly the
++        # same paths as the pattern the guard enforces -- neither wider nor
++        # narrower, so a stale round and a plain filename land the same way in
++        # both.
++        critique_doc = [
++            entry for entry in documented if "critique-" in entry
++        ]
++
++        self.assertEqual(len(critique_doc), 1, critique_doc)
++
++        matcher = documented_pattern(critique_doc[0])
++        guard_patterns = [
++            pattern
++            for pattern in guard.PROTECTED_EVIDENCE_PATTERNS
++            if "critique" in pattern
++        ]
++
++        self.assertEqual(len(guard_patterns), 1, guard_patterns)
++        self.assertEqual(len(documented), len(guard.PROTECTED_EVIDENCE_PATTERNS))
++
++        samples = [
++            ".ai/tasks/TASK-042/critique-plan-round-1.json",
++            ".ai/tasks/TASK-042/critique-plan-v4-round-2.json",
++            ".ai/tasks/TASK-042/critique-plan-v4-round-12.json",
++            ".ai/tasks/TASK-042/critique-plan-round-one.json",
++            ".ai/tasks/TASK-042/critique-plan-v4-round-2.md",
++            ".ai/tasks/TASK-042/critique.json",
++            ".ai/tasks/TASK-042/notes/critique-plan-round-1.json",
++            "critique-plan-round-1.json",
++        ]
++
++        for sample in samples:
++            with self.subTest(sample):
++                self.assertEqual(
++                    bool(matcher.match(sample)),
++                    bool(re.search(guard_patterns[0], sample)),
++                    sample,
++                )
++
++
++class WorktreePreToolUseTests(TaskDirCase):
++    """The guard runs from the worktree and authorises from the checkout.
++
++    Once a worker's cwd is its recorded worktree, the copy of this hook that
++    executes is that worktree's. The approved plan it must authorise against is
++    the checkout's: a worktree copy of the plan would authorise its own bytes.
++    """
++
++    def setUp(self):
++        super().setUp()
++
++        self.worktree = self.tmp / ".worktrees" / self.task_id
++        (self.worktree / ".ai" / "hooks").mkdir(parents=True)
++        shutil.copy2(
++            HOOKS / "pre_tool_use.py",
++            self.worktree / ".ai" / "hooks" / "pre_tool_use.py",
++        )
++
++        self.write_requirement()
++        self.write_plan(
++            "plan.json",
++            plan_json(
++                files_to_modify=[
++                    {"path": ".ai/scripts/orchestrator.py", "purpose": "declared"}
++                ]
++            ),
++        )
++        self.write_state(
++            status="AWAITING_APPROVAL",
++            worktree=".worktrees/%s" % self.task_id,
++        )
++
++        with quiet():
++            orch.approve_plan(self.task_id)
++
++        self.write_state(
++            status="IMPLEMENTING", worktree=".worktrees/%s" % self.task_id
++        )
++
++        # A decoy the worktree copy must not believe: same task id, same file
++        # names, a plan declaring something the developer never approved.
++        decoy = self.worktree / ".ai" / "tasks" / self.task_id
++        decoy.mkdir(parents=True)
++        shutil.copy2(self.task_path / "state.json", decoy / "state.json")
++        shutil.copy2(self.task_path / "events.jsonl", decoy / "events.jsonl")
++        (decoy / "plan.json").write_text(
++            plan_json(
++                files_to_modify=[
++                    {"path": ".ai/hooks/pre_tool_use.py", "purpose": "decoy"}
++                ]
++            ),
++            encoding="utf-8",
++        )
++
++    def _write(self, path):
++        """Run the worktree's copy, from the worktree, as the harness would."""
++        environment = {
++            key: value
++            for key, value in os.environ.items()
++            if not key.startswith("ORCHESTRATOR_")
++        }
++        environment.update(orch.worker_env(self.task_id))
++
++        return subprocess.run(
++            [
++                sys.executable,
++                str(self.worktree / ".ai" / "hooks" / "pre_tool_use.py"),
++            ],
++            input=json.dumps(
++                {"tool_name": "Edit", "tool_input": {"file_path": path}}
++            ),
++            cwd=str(self.worktree),
++            capture_output=True,
++            text=True,
++            env=environment,
++        )
++
++    def test_authoritative_plan_allows_only_declared_infrastructure(self):
++        declared = self._write(".ai/scripts/orchestrator.py")
++
++        self.assertEqual(declared.returncode, ALLOW, declared.stderr)
++
++        # The same file named absolutely inside the worktree, which is how an
++        # agent rooted there refers to it.
++        absolute = self._write(
++            str(self.worktree.resolve() / ".ai" / "scripts" / "orchestrator.py")
++        )
++
++        self.assertEqual(absolute.returncode, ALLOW, absolute.stderr)
++
++        undeclared = self._write(".ai/scripts/review-package.py")
++
++        self.assertEqual(undeclared.returncode, DENY)
++        self.assertIn("does not declare it", undeclared.stderr)
++
++        # Declared by the worktree's decoy plan and by nothing the developer
++        # approved: the authoritative plan is the checkout's.
++        decoyed = self._write(".ai/hooks/pre_tool_use.py")
++
++        self.assertEqual(decoyed.returncode, DENY)
++        self.assertIn("does not declare it", decoyed.stderr)
++
++    def test_a_plan_edited_after_approval_authorises_nothing(self):
++        """Approval is bound to the plan's bytes, re-checked at write time."""
++        (self.task_path / "plan.json").write_text(
++            plan_json(
++                files_to_modify=[
++                    {"path": ".ai/scripts/orchestrator.py", "purpose": "edited"},
++                    {"path": ".ai/scripts/review-package.py", "purpose": "new"},
++                ]
++            ),
++            encoding="utf-8",
++        )
++
++        result = self._write(".ai/scripts/orchestrator.py")
++
++        self.assertEqual(result.returncode, DENY)
++
++    def test_ordinary_source_in_the_worktree_is_untouched(self):
++        result = self._write("widget.py")
++
++        self.assertEqual(result.returncode, ALLOW, result.stderr)
++
++
 +class DispatchTests(unittest.TestCase):
 +    def test_cost_is_read_only_and_unlocked(self):
 +        self.assertNotIn("cost", orch.ACTIONS)
@@ -13314,10 +15185,10 @@ index 0000000..e7f9d83
 +    unittest.main()
 diff --git a/test_plan_contract.py b/test_plan_contract.py
 new file mode 100644
-index 0000000..9758511
+index 0000000..f6fe303
 --- /dev/null
 +++ b/test_plan_contract.py
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,451 @@
 +"""Phase 1 - the plan is a parsed contract, not prose that happens to parse.
 +
 +Plans were emitted as YAML and never parsed: Codex's raw last message went
@@ -13328,6 +15199,7 @@ index 0000000..9758511
 +
 +import json
 +import unittest
++from unittest import mock
 +
 +from _support import (
 +    REPO_ROOT,
@@ -13335,6 +15207,7 @@ index 0000000..9758511
 +    VALID_PLAN,
 +    load_orchestrator,
 +    plan_json,
++    quiet,
 +)
 +
 +orch = load_orchestrator()
@@ -13665,6 +15538,104 @@ index 0000000..9758511
 +        ).read_text(encoding="utf-8")
 +
 +        self.assertIn('verify.replace("{python}", interpreter())', source)
++
++
++class InitialPlanningFailureTests(TaskDirCase):
++    """A planning worker that exits non-zero is a handled outcome.
++
++    ``run_replan`` already recorded REPLAN_FAILED for exactly this failure
++    mode, while ``run_plan`` let the worker's CalledProcessError escape as a
++    raw traceback: the task stayed in PLANNING with ``plan_file: null`` and no
++    PLAN_FAILED event, so nothing in the trail recorded that planning had been
++    attempted at all. Observed on TASK-008's own planning run, which died in an
++    HTTP 400 from the planner.
++    """
++
++    def _planning(self):
++        self.write_requirement()
++        self.write_state(status="PLANNING", plan_file=None)
++
++    def _plan_with(self, side_effect):
++        with mock.patch.object(
++            orch.subprocess, "run", side_effect=side_effect
++        ):
++            with quiet() as out:
++                code = orch.run_plan(self.task_id)
++
++        return code, out.getvalue()
++
++    def test_nonzero_worker_records_plan_failed_and_actionable_state(self):
++        """The stubbed worker exits non-zero; assert the trail and the state."""
++        self._planning()
++
++        error = orch.subprocess.CalledProcessError(
++            1, ["codex"], stderr="HTTP 400 from the planner"
++        )
++        code, output = self._plan_with(error)
++
++        # Not a traceback: a return code, a reason and a next verb.
++        self.assertEqual(code, 1)
++        self.assertIn("planning failed", output)
++        self.assertIn("route-failure", output)
++
++        state = self.read_state()
++        self.assertEqual(state["status"], "FAILED")
++        self.assertIn("plan-worker", state["failure_reason"])
++
++        # FAILED is a state route-failure accepts, which is what "actionable"
++        # means here: PLANNING was accepted by nothing but `plan` itself. That
++        # the route really runs is asserted next door, on this same fixture.
++        failed = [e for e in self.events() if e["event"] == "PLAN_FAILED"]
++
++        self.assertEqual(len(failed), 1)
++        self.assertEqual(failed[0]["worker"], "codex")
++        self.assertIn("plan-worker", failed[0]["failure_reason"])
++        self.assertEqual(failed[0]["plan_version"], 1)
++
++        # And the blackboard carries it forward to whoever runs next.
++        observations = [
++            block
++            for block in orch.read_context(self.task_id)
++            if block["type"] == "failure_observation"
++        ]
++        self.assertTrue(
++            any("Planning failed" in block["content"] for block in observations)
++        )
++
++    def test_the_failed_planning_task_can_be_routed(self):
++        """The claim is that the resulting state is actionable. Act on it."""
++        self._planning()
++        self._plan_with(orch.subprocess.CalledProcessError(1, ["codex"]))
++
++        with mock.patch.object(
++            orch,
++            "classify_failure_with_agent",
++            return_value=("DEVELOPER_CLARIFICATION", {"source": "test"}),
++        ):
++            with quiet():
++                self.assertEqual(orch.route_failure(self.task_id), 0)
++
++        self.assertTrue(
++            orch.has_event(self.task_id, "DEVELOPER_CLARIFICATION_REQUIRED")
++        )
++
++    def test_a_missing_worker_executable_is_also_handled(self):
++        """The other way the planner fails to run at all."""
++        self._planning()
++
++        code, output = self._plan_with(FileNotFoundError(2, "not found"))
++
++        self.assertEqual(code, 1)
++        self.assertEqual(self.read_state()["status"], "FAILED")
++        self.assertIn("planning failed", output)
++        self.assertTrue(orch.has_event(self.task_id, "PLAN_FAILED"))
++
++    def test_no_plan_file_is_recorded_for_a_failed_run(self):
++        """A failed planning run must not leave a plan pointer behind."""
++        self._planning()
++        self._plan_with(orch.subprocess.CalledProcessError(1, ["codex"]))
++
++        self.assertIsNone(self.read_state().get("plan_file"))
 +
 +
 +if __name__ == "__main__":
@@ -14354,10 +16325,10 @@ index 0000000..4dc88f5
 +    unittest.main()
 diff --git a/test_replan_resume.py b/test_replan_resume.py
 new file mode 100644
-index 0000000..78e851b
+index 0000000..fc87d3f
 --- /dev/null
 +++ b/test_replan_resume.py
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,720 @@
 +"""REPLANNING must not be a dead end.
 +
 +`route_failure` set REPLANNING and bumped `plan_version` *before* invoking the
@@ -14858,6 +16829,212 @@ index 0000000..78e851b
 +        self.assertFalse(ran)
 +
 +
++class PersistedCritiqueTests(TaskDirCase):
++    """A critique that is counted is not a critique that is recorded.
++
++    ``critique_round`` recorded ``issues=len(...)`` and ``blocking=len(...)``
++    and sent the text to stdout. So a developer at the approval gate was told
++    two blocking issues existed with no way to read them -- observed on
++    TASK-008's own plan v1, whose critique had to be recovered from a transient
++    524 KB log.
++
++    Driven through the ordinary planning and replanning control flow, not by
++    calling ``persist_critique`` directly: what is under test is that the
++    artifact exists by the time the developer is sent to read it.
++    """
++
++    HIGH = {
++        "severity": "high",
++        "issue": "AC-3 cannot fail: its verify command exits 0 regardless.",
++        "suggestion": "Assert the refusal, not the happy path.",
++    }
++    LOW = {
++        "severity": "low",
++        "issue": "The objective repeats the requirement's first line.",
++        "suggestion": "Say what changes, not what was asked.",
++    }
++
++    def _planning(self):
++        self.write_requirement()
++        self.write_state(status="PLANNING", plan_file=None)
++
++    def _run_planning(self, reply):
++        """Plan for real, with codex and the critic doubled."""
++
++        def fake_run(argv, **kwargs):
++            if worker_name(argv) == "claude":
++                return mock.Mock(
++                    returncode=0, stdout=json.dumps(reply), stderr=""
++                )
++
++            (self.task_path / "plan.json").write_text(
++                plan_json(), encoding="utf-8"
++            )
++            return mock.Mock(returncode=0, stdout="", stderr="")
++
++        with mock.patch.object(orch.subprocess, "run", side_effect=fake_run):
++            with quiet() as out:
++                code = orch.run_plan(self.task_id)
++
++        return code, out.getvalue()
++
++    def _read(self, path):
++        return json.loads(path.read_text(encoding="utf-8"))
++
++    def test_persisted_critique_contains_issue_text_and_severity(self):
++        """Readable off disk, without consulting process output."""
++        self._planning()
++
++        reply = {
++            "verdict": "pass",
++            "issues": [self.LOW],
++        }
++        code, _ = self._run_planning(reply)
++
++        self.assertEqual(code, 0)
++
++        path = orch.critique_file(
++            self.task_id, self.task_path / "plan.json", 1
++        )
++        self.assertTrue(path.is_file(), "no critique artifact at %s" % path)
++
++        recorded = self._read(path)
++
++        self.assertEqual(recorded["issues"], [self.LOW])
++        self.assertEqual(recorded["issues"][0]["severity"], "low")
++        self.assertIn("repeats the requirement", recorded["issues"][0]["issue"])
++        self.assertEqual(recorded["verdict"], "pass")
++        self.assertEqual(recorded["task_id"], self.task_id)
++        self.assertTrue(recorded["ran"])
++
++        # And the trail names the file, so the artifact is discoverable from
++        # the evidence rather than only by construction.
++        events = [
++            e
++            for e in self.events()
++            if e["event"] == "PLAN_CRITIQUE_RECORDED"
++        ]
++        self.assertEqual(len(events), 1)
++        self.assertEqual(orch.Path(events[-1]["critique_file"]), path)
++
++    def test_rounds_exhausted_persists_current_blocking_critique_identity(
++        self,
++    ):
++        """The artifact the developer is told to read before approving."""
++        self._planning()
++
++        reply = {
++            "verdict": "revise",
++            "issues": [self.HIGH, self.LOW],
++            "blocking": [self.HIGH],
++        }
++        code, output = self._run_planning(reply)
++
++        self.assertEqual(code, 0)
++        self.assertIn("still objects", output)
++        self.assertEqual(self.read_state()["status"], "AWAITING_APPROVAL")
++
++        plan_file = self.task_path / "plan.json"
++        final = orch.critique_file(
++            self.task_id, plan_file, orch.CRITIC_MAX_ROUNDS
++        )
++        self.assertTrue(final.is_file(), "no final critique at %s" % final)
++
++        recorded = self._read(final)
++
++        # It is the current one, and it says so: round and plan version, not
++        # just "a critique happened".
++        self.assertTrue(recorded["rounds_exhausted"])
++        self.assertFalse(recorded["acceptable"])
++        self.assertEqual(recorded["round"], orch.CRITIC_MAX_ROUNDS)
++        self.assertEqual(recorded["max_rounds"], orch.CRITIC_MAX_ROUNDS)
++        self.assertEqual(recorded["plan_version"], 1)
++        self.assertEqual(recorded["plan_stem"], "plan")
++        self.assertEqual(recorded["verdict"], "revise")
++
++        # The blocking issue text and both severities survived.
++        self.assertEqual(recorded["blocking"], [self.HIGH])
++        self.assertEqual(recorded["blocking_count"], 1)
++        self.assertEqual(
++            [issue["severity"] for issue in recorded["issues"]],
++            ["high", "low"],
++        )
++        self.assertIn("cannot fail", recorded["blocking"][0]["issue"])
++        self.assertEqual(
++            recorded["blocking"][0]["suggestion"], self.HIGH["suggestion"]
++        )
++
++        # Every earlier round is on disk too, and none of them claims to be
++        # the exhausted one.
++        earlier = self._read(orch.critique_file(self.task_id, plan_file, 1))
++
++        self.assertEqual(earlier["round"], 1)
++        self.assertFalse(earlier["rounds_exhausted"])
++
++    def test_artifact_name_distinguishes_plan_version_and_round(self):
++        """A stale round must not be able to pass for the current one."""
++        self._planning()
++
++        reply = {
++            "verdict": "revise",
++            "issues": [self.HIGH],
++            "blocking": [self.HIGH],
++        }
++        self._run_planning(reply)
++
++        # A replan writes plan-v2.json, so its critique lands beside the
++        # first plan's rather than on top of it.
++        plan_v2 = self.task_path / "plan-v2.json"
++        plan_v2.write_text(plan_json(), encoding="utf-8")
++        _, state = orch.load_state(self.task_id)
++        state["plan_version"] = 2
++
++        with mock.patch.object(
++            orch, "critique_plan", return_value=(False, {
++                "ran": True,
++                "verdict": "revise",
++                "issues": [self.HIGH],
++                "blocking": [self.HIGH],
++            })
++        ):
++            with quiet():
++                orch.critique_round(self.task_id, plan_v2, state, 1)
++
++        names = sorted(
++            path.name for path in self.task_path.glob("critique-*.json")
++        )
++
++        self.assertEqual(
++            names,
++            [
++                "critique-plan-round-1.json",
++                "critique-plan-round-2.json",
++                "critique-plan-v2-round-1.json",
++            ],
++        )
++
++        # The path is derivable from task id, plan stem and round -- which is
++        # what lets a developer find the current artifact without reading the
++        # implementation.
++        derived = orch.critique_file(self.task_id, plan_v2, 1)
++
++        self.assertEqual(derived.name, "critique-plan-v2-round-1.json")
++        # Task-relative, like every other piece of evidence: the orchestrator
++        # runs from the checkout, so this resolves into the task directory.
++        self.assertEqual(derived.resolve().parent, self.task_path.resolve())
++
++        # And the payload identifies itself, so a file copied out of the
++        # directory is still attributable.
++        current = self._read(derived)
++        stale = self._read(
++            orch.critique_file(self.task_id, self.task_path / "plan.json", 1)
++        )
++
++        self.assertEqual((current["plan_version"], current["round"]), (2, 1))
++        self.assertEqual((stale["plan_version"], stale["round"]), (1, 1))
++        self.assertNotEqual(current["plan_stem"], stale["plan_stem"])
++
++
 +class ReplanDispatchTests(unittest.TestCase):
 +    def test_replan_is_a_dispatchable_verb(self):
 +        self.assertIn("replan", orch.ACTIONS)
@@ -14874,10 +17051,10 @@ index 0000000..78e851b
 +    unittest.main()
 diff --git a/test_repo_hygiene.py b/test_repo_hygiene.py
 new file mode 100644
-index 0000000..d444ac3
+index 0000000..cc49675
 --- /dev/null
 +++ b/test_repo_hygiene.py
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,593 @@
 +"""Repository hygiene: .gitignore says what we mean.
 +
 +A .gitignore is easy to write once and then drift. These tests ask git itself
@@ -14890,8 +17067,10 @@ index 0000000..d444ac3
 +exists to prevent.
 +"""
 +
++import re
 +import shutil
 +import subprocess
++import tempfile
 +import unittest
 +from pathlib import Path
 +
@@ -14899,17 +17078,344 @@ index 0000000..d444ac3
 +
 +HAVE_GIT = shutil.which("git") is not None
 +GITIGNORE = REPO_ROOT / ".gitignore"
++WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
++
++KEY_RE = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_.\-]*):(?:\s+(?P<rest>.*))?$")
++BLOCK_SCALAR = ("|", ">", "|-", ">-", "|+", ">+")
++
++
++class WorkflowError(ValueError):
++    """The workflow could not be read as the structure this check needs.
++
++    Its own exception type so a test can demand a *parse* failure rather than
++    accept any ValueError raised somewhere along the way.
++    """
++
++
++def _strip_comment(line):
++    """Drop a trailing comment, honouring quotes.
++
++    Narrow on purpose: `#` inside single or double quotes is content, anywhere
++    else it starts a comment. That is the whole of the comment syntax this
++    workflow uses.
++    """
++    quote = None
++    out = []
++
++    for index, char in enumerate(line):
++        if quote:
++            if char == quote:
++                quote = None
++        elif char in "\"'":
++            quote = char
++        elif char == "#" and (index == 0 or line[index - 1] in " \t"):
++            break
++
++        out.append(char)
++
++    if quote:
++        raise WorkflowError("unterminated quote: %r" % line)
++
++    return "".join(out).rstrip()
++
++
++def _parse_scalar(text):
++    """A scalar or a flow sequence. Anything else is unrecognised."""
++    text = text.strip()
++
++    if text.startswith("["):
++        if not text.endswith("]"):
++            raise WorkflowError("unterminated flow sequence: %r" % text)
++
++        inner = text[1:-1].strip()
++
++        if not inner:
++            return []
++
++        return [_parse_scalar(item) for item in inner.split(",")]
++
++    if text.startswith("{"):
++        # Flow mappings are not used by this workflow, and guessing at one is
++        # how a reader starts reporting on structure it never understood.
++        raise WorkflowError("flow mappings are not supported: %r" % text)
++
++    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
++        return text[1:-1]
++
++    return text
++
++
++class _Line:
++    __slots__ = ("indent", "text", "number")
++
++    def __init__(self, indent, text, number):
++        self.indent = indent
++        self.text = text
++        self.number = number
++
++
++def _significant_lines(text):
++    lines = []
++
++    for number, raw in enumerate(text.splitlines(), 1):
++        if raw.lstrip().startswith("---") or raw.lstrip().startswith("..."):
++            continue
++
++        body = _strip_comment(raw)
++
++        if not body.strip():
++            continue
++
++        stripped = body.lstrip(" ")
++        indent = len(body) - len(stripped)
++
++        if "\t" in body[:indent]:
++            raise WorkflowError("tab indentation at line %d" % number)
++
++        lines.append(_Line(indent, stripped, number))
++
++    return lines
++
++
++def _skip_deeper(lines, pos, indent):
++    while pos < len(lines) and lines[pos].indent > indent:
++        pos += 1
++
++    return pos
++
++
++def _parse_block(lines, pos, indent):
++    if lines[pos].text == "-" or lines[pos].text.startswith("- "):
++        return _parse_sequence(lines, pos, indent)
++
++    return _parse_mapping(lines, pos, indent)
++
++
++def _parse_sequence(lines, pos, indent):
++    items = []
++
++    while pos < len(lines) and lines[pos].indent == indent:
++        line = lines[pos]
++
++        if line.text != "-" and not line.text.startswith("- "):
++            raise WorkflowError(
++                "expected a sequence item at line %d: %r"
++                % (line.number, line.text)
++            )
++
++        rest = line.text[2:] if line.text.startswith("- ") else ""
++        child = indent + 2
++
++        if KEY_RE.match(rest):
++            # `- name: Checkout` opens a mapping whose first key sits in the
++            # item's own column, with any further keys indented to match.
++            synthetic = [_Line(child, rest, line.number)]
++            pos += 1
++
++            while pos < len(lines) and lines[pos].indent >= child:
++                synthetic.append(lines[pos])
++                pos += 1
++
++            value, _ = _parse_mapping(synthetic, 0, child)
++            items.append(value)
++            continue
++
++        pos += 1
++
++        if rest.strip():
++            items.append(_parse_scalar(rest))
++        elif pos < len(lines) and lines[pos].indent > indent:
++            value, pos = _parse_block(lines, pos, lines[pos].indent)
++            items.append(value)
++        else:
++            items.append(None)
++
++    return items, pos
++
++
++def _parse_mapping(lines, pos, indent):
++    mapping = {}
++
++    while pos < len(lines):
++        line = lines[pos]
++
++        if line.indent < indent:
++            break
++
++        if line.indent > indent:
++            raise WorkflowError(
++                "unexpected indentation at line %d: %r"
++                % (line.number, line.text)
++            )
++
++        match = KEY_RE.match(line.text)
++
++        if not match:
++            raise WorkflowError(
++                "unrecognised line %d: %r" % (line.number, line.text)
++            )
++
++        key = match.group("key")
++        rest = (match.group("rest") or "").strip()
++        pos += 1
++
++        if rest in BLOCK_SCALAR:
++            end = _skip_deeper(lines, pos, indent)
++            mapping[key] = "\n".join(
++                item.text for item in lines[pos:end]
++            )
++            pos = end
++        elif rest:
++            mapping[key] = _parse_scalar(rest)
++        elif pos < len(lines) and lines[pos].indent > indent:
++            mapping[key], pos = _parse_block(lines, pos, lines[pos].indent)
++        else:
++            mapping[key] = None
++
++    return mapping, pos
++
++
++def parse_workflow(text):
++    """The workflow as nested dicts, lists and strings.
++
++    A deliberately small hand-written reader: the repository is standard
++    library only, and the alternative -- matching `"3.9"` as a substring --
++    passes on a comment and fails on a cosmetic reformat. It supports the
++    constructs this workflow actually uses and **raises** on anything else, so
++    "we could not understand the file" can never be reported as "the matrix is
++    fine".
++    """
++    lines = _significant_lines(text)
++
++    if not lines:
++        raise WorkflowError("workflow is empty")
++
++    if lines[0].indent != 0:
++        raise WorkflowError("workflow does not start at column 0")
++
++    document, pos = _parse_mapping(lines, 0, 0)
++
++    if pos != len(lines):
++        raise WorkflowError(
++            "trailing content at line %d" % lines[pos].number
++        )
++
++    if not document:
++        raise WorkflowError("workflow has no top-level keys")
++
++    return document
++
++
++def matrix_python_versions(path):
++    """Every Python version the workflow's job matrices declare.
++
++    Raises WorkflowError when the file is absent, unreadable, unparsable or
++    structurally not what this check reads -- never an empty result, which a
++    caller could mistake for "no versions are configured, so nothing to see".
++    """
++    path = Path(path)
++
++    if not path.is_file():
++        raise WorkflowError("no workflow at %s" % path)
++
++    try:
++        document = parse_workflow(path.read_text(encoding="utf-8"))
++    except (OSError, UnicodeDecodeError) as exc:
++        raise WorkflowError("workflow is unreadable: %s" % exc)
++
++    jobs = document.get("jobs")
++
++    if not isinstance(jobs, dict) or not jobs:
++        raise WorkflowError("workflow declares no jobs")
++
++    versions = []
++
++    for name, job in jobs.items():
++        if not isinstance(job, dict):
++            raise WorkflowError("job %s is not a mapping" % name)
++
++        matrix = (job.get("strategy") or {})
++
++        if not isinstance(matrix, dict):
++            raise WorkflowError("job %s has an unreadable strategy" % name)
++
++        matrix = matrix.get("matrix")
++
++        if matrix is None:
++            continue
++
++        if not isinstance(matrix, dict):
++            raise WorkflowError("job %s has an unreadable matrix" % name)
++
++        declared = matrix.get("python-version")
++
++        if declared is None:
++            continue
++
++        if not isinstance(declared, list) or not declared:
++            raise WorkflowError(
++                "job %s declares python-version as %r, which is not a "
++                "non-empty sequence" % (name, declared)
++            )
++
++        for entry in declared:
++            if not isinstance(entry, str) or not entry.strip():
++                raise WorkflowError(
++                    "job %s declares a non-string version: %r" % (name, entry)
++                )
++
++            versions.append(entry.strip())
++
++    if not versions:
++        raise WorkflowError("no job declares a python-version matrix")
++
++    return versions
 +
 +
 +def is_ignored(path):
 +    """Ask git, rather than re-implementing its matching rules."""
++    return bool(ignored_among([path]))
++
++
++def ignored_among(paths):
++    """Which of ``paths`` git would ignore, in one invocation.
++
++    Same question as ``is_ignored`` and the same answer from the same tool,
++    asked once for the whole set: ``--stdin`` prints back only the paths that
++    match, so a per-path call per tracked file (one git process each) is not
++    needed to check a repository's worth of them.
++
++    Byte I/O with ``-z`` rather than text mode: ``text=True`` rewrites the
++    separator to CRLF on Windows, and git then treats the CR as part of the
++    path and quotes it, so nothing ever matches.
++    """
++    candidates = [str(path) for path in paths]
++
++    if not candidates:
++        return []
++
 +    result = subprocess.run(
-+        ["git", "check-ignore", "-q", "--no-index", path],
++        ["git", "check-ignore", "--no-index", "--stdin", "-z"],
 +        cwd=str(REPO_ROOT),
++        input=("\0".join(candidates) + "\0").encode("utf-8"),
 +        capture_output=True,
-+        text=True,
 +    )
-+    return result.returncode == 0
++
++    # 0: something matched, 1: nothing matched. Anything else is git failing
++    # to answer, which must not read as "nothing is ignored".
++    if result.returncode not in (0, 1):
++        raise AssertionError(
++            "git check-ignore failed: %s"
++            % (result.stderr.decode("utf-8", "replace").strip() or "no output")
++        )
++
++    matched = {
++        entry
++        for entry in result.stdout.decode("utf-8").split("\0")
++        if entry
++    }
++
++    return [path for path in candidates if path in matched]
 +
 +
 +@unittest.skipUnless(HAVE_GIT, "git not available")
@@ -14957,29 +17463,35 @@ index 0000000..d444ac3
 +    """The audit trail and the workflow itself must stay tracked."""
 +
 +    def test_task_evidence_is_not_ignored(self):
-+        for name in (
-+            "state.json",
-+            "events.jsonl",
-+            "test-results.json",
-+            "validation.md",
-+            "plan.json",
-+            "implementation.md",
-+            "context.jsonl",
-+            "review-findings.json",
-+            "review-summary.md",
-+            "clarifications.json",
-+        ):
-+            path = ".ai/tasks/TASK-001/" + name
-+            self.assertFalse(is_ignored(path), path)
++        paths = [
++            ".ai/tasks/TASK-001/" + name
++            for name in (
++                "state.json",
++                "events.jsonl",
++                "test-results.json",
++                "validation.md",
++                "plan.json",
++                "implementation.md",
++                "context.jsonl",
++                "review-findings.json",
++                "review-summary.md",
++                "clarifications.json",
++            )
++        ]
++
++        self.assertEqual(ignored_among(paths), [])
 +
 +    def test_committed_task_004_artifacts_are_not_ignored(self):
 +        """Regression: the existing audit trail must remain visible."""
-+        for path in REPO_ROOT.glob(".ai/tasks/TASK-004/*"):
-+            relative = path.relative_to(REPO_ROOT).as_posix()
-+            self.assertFalse(is_ignored(relative), relative)
++        paths = [
++            path.relative_to(REPO_ROOT).as_posix()
++            for path in REPO_ROOT.glob(".ai/tasks/TASK-004/*")
++        ]
++
++        self.assertEqual(ignored_among(paths), [])
 +
 +    def test_workflow_infrastructure_is_not_ignored(self):
-+        for path in (
++        paths = [
 +            ".ai/scripts/orchestrator.py",
 +            ".ai/scripts/review-package.py",
 +            ".ai/hooks/pre_tool_use.py",
@@ -14990,12 +17502,14 @@ index 0000000..d444ac3
 +            ".claude/settings.json",
 +            ".claude/agents/implementer.md",
 +            ".github/workflows/ci.yml",
-+        ):
-+            self.assertFalse(is_ignored(path), path)
++        ]
++
++        self.assertEqual(ignored_among(paths), [])
 +
 +    def test_tests_and_pins_are_not_ignored(self):
-+        for path in ("test_hardening.py", "_support.py", ".python-version"):
-+            self.assertFalse(is_ignored(path), path)
++        paths = ["test_hardening.py", "_support.py", ".python-version"]
++
++        self.assertEqual(ignored_among(paths), [])
 +
 +    def test_no_currently_tracked_file_is_ignored(self):
 +        """A tracked-but-ignored file is a contradiction git will not resolve."""
@@ -15007,7 +17521,7 @@ index 0000000..d444ac3
 +            check=True,
 +        ).stdout.split()
 +
-+        offenders = [path for path in tracked if is_ignored(path)]
++        offenders = ignored_among(tracked)
 +
 +        self.assertEqual(offenders, [], "tracked files matched by .gitignore")
 +
@@ -15034,6 +17548,102 @@ index 0000000..d444ac3
 +
 +        self.assertIn("audit trail", text)
 +        self.assertIn(".ai/tasks/", text)
++
++
++class CiMatrixTests(unittest.TestCase):
++    """The CI matrix still runs both supported interpreters.
++
++    A deliberate regression guard: nothing in this task touches the workflow,
++    and that is the point -- multi-version coverage is CI's job, because an
++    acceptance command may only use `{python}`.
++    """
++
++    def test_ci_matrix_includes_python_39_and_312(self):
++        versions = matrix_python_versions(WORKFLOW)
++
++        self.assertIn("3.9", versions)
++        self.assertIn("3.12", versions)
++
++    def test_a_cosmetic_reformat_does_not_fail_the_check(self):
++        """Structure, not spelling: the same matrix written as a block list."""
++        reformatted = """
++name: CI
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    strategy:
++      matrix:
++        python-version:
++          - '3.9'
++          - "3.12"
++    steps:
++      - name: Run tests
++        run: |
++          python -m unittest -v
++"""
++        with tempfile.TemporaryDirectory() as tmp:
++            path = Path(tmp) / "ci.yml"
++            path.write_text(reformatted, encoding="utf-8")
++
++            self.assertEqual(
++                matrix_python_versions(path), ["3.9", "3.12"]
++            )
++
++    def test_missing_or_unparsable_workflow_fails(self):
++        """"Cannot parse" must never be a pass, and must never be a skip.
++
++        Every input here is one this check has no answer for. Each has to raise
++        rather than return an empty list a caller could read as "no versions
++        are configured".
++        """
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++
++            with self.assertRaises(WorkflowError):
++                matrix_python_versions(root / "absent.yml")
++
++            unparsable = {
++                "empty": "",
++                "comments only": "# nothing here\n",
++                "not yaml at all": "\x00\x01 binary-ish garbage\n",
++                "tab indented": "jobs:\n\ttest:\n\t\truns-on: x\n",
++                "no jobs": "name: CI\non:\n  push:\n    branches:\n      - main\n",
++                "job is a scalar": "jobs:\n  test: ubuntu\n",
++                "matrix is a scalar": (
++                    "jobs:\n  test:\n    strategy:\n      matrix: 3.9\n"
++                ),
++                "version is not a sequence": (
++                    "jobs:\n  test:\n    strategy:\n      matrix:\n"
++                    "        python-version: 3.9\n"
++                ),
++                "no matrix at all": (
++                    "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
++                ),
++                "unterminated flow sequence": (
++                    "jobs:\n  test:\n    strategy:\n      matrix:\n"
++                    '        python-version: ["3.9", "3.12"\n'
++                ),
++            }
++
++            for label, content in unparsable.items():
++                path = root / "ci.yml"
++                path.write_text(content, encoding="utf-8")
++
++                with self.subTest(label):
++                    with self.assertRaises(WorkflowError):
++                        matrix_python_versions(path)
++
++    def test_the_real_workflow_still_runs_the_suite(self):
++        """The matrix is only evidence if the matrixed job runs the tests."""
++        document = parse_workflow(WORKFLOW.read_text(encoding="utf-8"))
++        steps = document["jobs"]["test"]["steps"]
++        commands = [
++            step.get("run", "") for step in steps if isinstance(step, dict)
++        ]
++
++        self.assertTrue(
++            any("unittest" in command for command in commands), commands
++        )
 +
 +
 +if __name__ == "__main__":
@@ -15475,10 +18085,10 @@ index 0000000..895251b
 +    unittest.main()
 diff --git a/test_run_driver.py b/test_run_driver.py
 new file mode 100644
-index 0000000..3232bf1
+index 0000000..a70657a
 --- /dev/null
 +++ b/test_run_driver.py
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,1228 @@
 +"""Phase 1 - task creation (C8) and the `run` driver (audit 5.2).
 +
 +Two gaps this closes. Task creation was entirely manual, so ``NEW`` was
@@ -15486,12 +18096,26 @@ index 0000000..3232bf1
 +them decorative. And nine mechanical steps were driven by hand; the driver
 +collapses them into one idempotent command that stops only at a genuine human
 +decision.
++
++The ``recover`` cases at the bottom close the last dead end in that machine.
++``IMPLEMENTING`` had exactly one exit -- ``fix`` -- and ``fix`` needs a
++CLAUDE_FIX_STARTED event only ``route-failure`` can emit from FAILED. An
++``implement`` run killed between IMPLEMENTATION_STARTED and its outcome
++therefore had no legal verb at all, and could only be moved by hand-editing
++state.json.
 +"""
 +
++import json
++import os
++import re
++import subprocess
++import sys
 +import unittest
++from pathlib import Path
 +from unittest import mock
 +
 +from _support import (
++    REPO_ROOT,
 +    TaskDirCase,
 +    load_orchestrator,
 +    plan_json,
@@ -15502,6 +18126,17 @@ index 0000000..3232bf1
 +orch = load_orchestrator()
 +
 +PLAN_BODY = plan_json()
++
++ORCHESTRATOR = REPO_ROOT / ".ai" / "scripts" / "orchestrator.py"
++STATE_SCHEMA = REPO_ROOT / ".ai" / "schemas" / "task-state.schema.json"
++
++# Environment keys that would otherwise leak a real developer's assertion into
++# a test's recovery. Cleared per call, so a refusal test cannot be rescued by
++# whatever happened to be exported in the shell that ran the suite.
++RECOVERY_ENV_KEYS = (
++    orch.RECOVER_ASSERTER_ENV,
++    orch.RECOVER_LOCK_OVERRIDE_ENV,
++)
 +
 +
 +class AllocateTaskIdTests(TaskDirCase):
@@ -15819,6 +18454,34 @@ index 0000000..3232bf1
 +
 +        self.assertIn("no routed failure", out.getvalue())
 +
++    def test_interrupted_implementing_stops_and_names_recover(self):
++        """The driver still refuses -- and now says which verb does the work.
++
++        `run` deliberately does not self-heal: resuming an interrupted
++        implementation on its own would be guessing at what the killed worker
++        had finished. What it must not do is leave the developer with no verb,
++        which is what "inspect the task before continuing" amounted to.
++
++        Asserted as the command form rather than the word: "recover" already
++        appears in orchestrator.py as "recoverable" and "recovered", so a
++        substring check proves nothing.
++        """
++        self.write_state(status="IMPLEMENTING")
++        orch.record_event(
++            self.task_id, "IMPLEMENTATION_STARTED", worker="claude",
++            mode="implement",
++        )
++
++        with quiet() as out:
++            self.assertEqual(orch.run_driver(self.task_id), 1)
++
++        output = out.getvalue()
++
++        self.assertIn("orchestrator.py %s recover" % self.task_id, output)
++        self.assertIn("will not resume it on its own", output)
++        # It refused: the task is exactly where it was.
++        self.assertEqual(self.read_state()["status"], "IMPLEMENTING")
++
 +    def test_step_budget_is_bounded(self):
 +        self.assertGreater(orch.RUN_MAX_STEPS, 0)
 +        self.assertGreater(orch.RUN_MAX_FIX_ATTEMPTS, 0)
@@ -15834,14 +18497,832 @@ index 0000000..3232bf1
 +        self.assertIn("run", orch.USAGE)
 +
 +
++class RecoverCase(TaskDirCase):
++    """Fixtures for the `recover` verb.
++
++    Every trail is built out of real ``record_event`` calls rather than a
++    hand-written events.jsonl, so eligibility is tested against the event
++    vocabulary the orchestrator actually emits.
++    """
++
++    def _interrupted(self, mode="implement"):
++        """A task exactly where a killed `implement` run leaves one.
++
++        IMPLEMENTATION_STARTED is on the trail, nothing terminated it, and
++        there is no CLAUDE_FIX_STARTED -- so `implement`, `validate`,
++        `route-failure` and `fix` all refuse it.
++        """
++        self.write_requirement()
++        self.write_plan("plan.json", PLAN_BODY)
++        self.write_state(status="IMPLEMENTING")
++        orch.record_event(
++            self.task_id,
++            "IMPLEMENTATION_STARTED",
++            worker="claude",
++            mode=mode,
++            branch="feature/%s" % self.task_id,
++        )
++
++    def _recover(self, reason="the worker process was killed", **env):
++        """Run `recover` with a deliberately explicit environment."""
++        environment = {key: value for key, value in env.items()}
++
++        with mock.patch.dict(orch.os.environ, environment):
++            for key in RECOVERY_ENV_KEYS:
++                if key not in environment:
++                    orch.os.environ.pop(key, None)
++
++            with quiet() as out:
++                code = orch.run_recover(self.task_id, reason)
++
++        return code, out.getvalue()
++
++    def _snapshot(self):
++        """The bytes of the evidence a refusal must not touch."""
++        events = self.task_path / "events.jsonl"
++
++        return (
++            (self.task_path / "state.json").read_bytes(),
++            events.read_bytes() if events.is_file() else b"",
++        )
++
++
++class RecoverInterruptedImplementationTests(RecoverCase):
++    def test_recover_moves_eligible_interruption_to_failed(self):
++        """The mandated case: a routable state, reached by a verb."""
++        self._interrupted()
++
++        code, _ = self._recover()
++
++        self.assertEqual(code, 0)
++
++        state = self.read_state()
++        self.assertEqual(state["status"], "FAILED")
++        self.assertIn("interrupted-implementation", state["failure_reason"])
++
++        # FAILED is routable, which is the whole point: route-failure accepts
++        # it, so the task is no longer stranded.
++        self.assertEqual(
++            orch.recovery_eligibility(self.task_id, state)[0], False
++        )
++
++    def test_recovery_event_records_reason_and_developer(self):
++        self._interrupted()
++
++        code, _ = self._recover(
++            reason="host rebooted mid-implementation",
++            **{orch.RECOVER_ASSERTER_ENV: "mayank"},
++        )
++
++        self.assertEqual(code, 0)
++
++        interrupted = [
++            e
++            for e in self.events()
++            if e["event"] == "IMPLEMENTATION_INTERRUPTED"
++        ]
++
++        self.assertEqual(len(interrupted), 1)
++        self.assertEqual(
++            interrupted[0]["reason"], "host rebooted mid-implementation"
++        )
++        self.assertEqual(interrupted[0]["asserted_by"], "mayank")
++        self.assertEqual(interrupted[0]["assertion"], "human")
++        self.assertEqual(interrupted[0]["mode"], "implement")
++
++        recovered = [e for e in self.events() if e["event"] == "TASK_RECOVERED"]
++        self.assertEqual(recovered[-1]["from_state"], "IMPLEMENTING")
++        self.assertEqual(recovered[-1]["to_state"], "FAILED")
++        self.assertEqual(recovered[-1]["asserted_by"], "mayank")
++
++    def test_recover_preserves_interrupted_work_bytes(self):
++        """"Preserves all work on disk" has to be an assertion, not prose.
++
++        A recovery that reset the tree, re-captured the baseline or checked
++        anything out would satisfy every other criterion here while destroying
++        the evidence the verb exists to keep.
++        """
++        self._interrupted()
++
++        edited = self.tmp / "widget.py"
++        edited.write_bytes(b"SENTINEL = 1  # half-finished\r\nx = 2\n")
++        created = self.tmp / "new_module.py"
++        created.write_bytes(b"\xef\xbb\xbfvalue = 'partial'\n")
++        baseline_before = (self.task_path / "baseline.json")
++
++        before = {
++            path: path.read_bytes() for path in (edited, created)
++        }
++
++        code, _ = self._recover()
++
++        self.assertEqual(code, 0)
++
++        for path, content in before.items():
++            self.assertEqual(path.read_bytes(), content, path.name)
++
++        # And nothing re-captured a baseline behind the developer's back.
++        self.assertFalse(baseline_before.is_file())
++        self.assertFalse(
++            [e for e in self.events() if e["event"] == "BASELINE_CAPTURED"]
++        )
++
++    def test_recover_needs_a_reason(self):
++        self._interrupted()
++
++        code, output = self._recover(reason="   ")
++
++        self.assertEqual(code, 1)
++        self.assertIn("needs a reason", output)
++        self.assertEqual(self.read_state()["status"], "IMPLEMENTING")
++
++
++class RecoverEligibilityTests(RecoverCase):
++    """Three refusals, each on its own.
++
++    Without them `recover` could be an unconditional status setter: it would
++    accept a task in any state, one whose attempt already ended, or one already
++    routed to `fix`, and every other criterion would still pass. That is the
++    hand edit wearing a verb's clothes.
++    """
++
++    def test_recover_refuses_non_implementing_task(self):
++        self._interrupted()
++        self.write_state(status="AWAITING_APPROVAL")
++        before = self._snapshot()
++
++        code, output = self._recover()
++
++        self.assertEqual(code, 1)
++        self.assertIn("requires IMPLEMENTING", output)
++        self.assertEqual(self._snapshot(), before)
++
++    def test_recover_refuses_terminated_implementation(self):
++        """The attempt ended. It was not interrupted."""
++        self._interrupted()
++        orch.record_event(
++            self.task_id,
++            "VALIDATION_STARTED",
++            command="python -m unittest",
++        )
++        before = self._snapshot()
++
++        code, output = self._recover()
++
++        self.assertEqual(code, 1)
++        self.assertIn("VALIDATION_STARTED", output)
++        self.assertEqual(self._snapshot(), before)
++
++    def test_recover_refuses_a_terminated_attempt_for_every_terminator(self):
++        """Enumerated, so a missing terminator cannot quietly let one through."""
++        for terminator in orch.IMPLEMENTATION_TERMINATING_EVENTS:
++            with self.subTest(terminator=terminator):
++                for name in ("events.jsonl", "state.json"):
++                    path = self.task_path / name
++
++                    if path.is_file():
++                        path.unlink()
++
++                self._interrupted()
++                orch.record_event(self.task_id, terminator)
++
++                code, output = self._recover()
++
++                self.assertEqual(code, 1)
++                self.assertIn(terminator, output)
++
++    def test_recover_refuses_started_fix(self):
++        """`fix` is that task's legal verb; `recover` must not duplicate it."""
++        self._interrupted()
++        orch.record_event(self.task_id, "CLAUDE_FIX_STARTED", worker="claude")
++        before = self._snapshot()
++
++        code, output = self._recover()
++
++        self.assertEqual(code, 1)
++        self.assertIn("CLAUDE_FIX_STARTED", output)
++        self.assertEqual(self._snapshot(), before)
++
++    def test_recover_refuses_an_implementing_task_with_no_attempt(self):
++        """Fail closed: no recorded attempt means no interruption to establish."""
++        self.write_requirement()
++        self.write_plan("plan.json", PLAN_BODY)
++        self.write_state(status="IMPLEMENTING")
++
++        code, output = self._recover()
++
++        self.assertEqual(code, 1)
++        self.assertIn("no IMPLEMENTATION_STARTED", output)
++        self.assertEqual(self.read_state()["status"], "IMPLEMENTING")
++
++
++class RecoverLockSafetyTests(RecoverCase):
++    """Recovery is fail-closed on the lock, and only a human opens it."""
++
++    def _lock(self, body="pid=424242 at=2026-09-02T20:21:00+05:30\n"):
++        path = self.task_path / ".lock"
++        path.write_text(body, encoding="utf-8")
++        return path
++
++    def test_existing_lock_refuses_without_override(self):
++        self._interrupted()
++        lock = self._lock()
++        before = self._snapshot()
++
++        code, output = self._recover()
++
++        self.assertEqual(code, 1)
++        self.assertIn("locked", output)
++        self.assertEqual(self.read_state()["status"], "IMPLEMENTING")
++        # The lock is left alone: removing it would be the same unearned
++        # judgement the refusal exists to avoid.
++        self.assertTrue(lock.is_file())
++        self.assertEqual(self._snapshot(), before)
++
++    def test_dead_pid_lock_still_refuses_without_override(self):
++        """A pid that is demonstrably gone is still not authorisation.
++
++        The pid comes from a child this test ran to completion, so it is not a
++        guess about liveness. And `os.kill` is booby-trapped for the duration:
++        if the implementation probed it, this fails -- which is the point.
++        `os.kill(pid, 0)` is unsafe on Windows, where Python maps a non-CTRL
++        signal to TerminateProcess, so a "is it alive" probe can terminate a
++        running orchestrator.
++        """
++        child = subprocess.Popen(
++            [sys.executable, "-c", "pass"],
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.DEVNULL,
++        )
++        child.wait()
++        dead_pid = child.pid
++
++        self._interrupted()
++        self._lock("pid=%d at=2026-09-02T20:21:00+05:30\n" % dead_pid)
++
++        def refuse_to_probe(*args, **kwargs):
++            raise AssertionError(
++                "recovery probed process liveness; a pid must never authorise"
++            )
++
++        with mock.patch.object(orch.os, "kill", side_effect=refuse_to_probe):
++            code, output = self._recover()
++
++        self.assertEqual(code, 1)
++        self.assertIn("locked", output)
++        self.assertEqual(self.read_state()["status"], "IMPLEMENTING")
++
++    def test_override_records_attributable_human_assertion(self):
++        self._interrupted()
++        lock = self._lock()
++
++        code, _ = self._recover(
++            **{
++                orch.RECOVER_LOCK_OVERRIDE_ENV: "mayank",
++                orch.RECOVER_ASSERTER_ENV: "mayank",
++            }
++        )
++
++        self.assertEqual(code, 0)
++
++        overrides = [
++            e
++            for e in self.events()
++            if e["event"] == "RECOVERY_LOCK_OVERRIDDEN"
++        ]
++
++        self.assertEqual(len(overrides), 1)
++        self.assertEqual(overrides[0]["asserted_by"], "mayank")
++        self.assertTrue(overrides[0]["asserted_by"].strip())
++        self.assertEqual(overrides[0]["assertion"], "human")
++        # The pid is carried as detail, not as the reason it was allowed.
++        self.assertIn("pid=", overrides[0]["lock_holder"])
++        self.assertIn("advisory", overrides[0]["note"])
++        # The stale lock is cleared, so the next verb can take one.
++        self.assertFalse(lock.is_file())
++        self.assertEqual(self.read_state()["status"], "FAILED")
++
++    def test_an_empty_lock_is_still_a_lock(self):
++        """A zero-byte lock is the interruption case, not a missing lock.
++
++        ``task_lock`` creates the file with O_CREAT|O_EXCL and writes the pid
++        line afterwards, so a process killed between the two leaves exactly
++        this. Reading the *holder* as the flag meaning "a lock existed" made
++        such a lock override itself: no RECOVERY_LOCK_OVERRIDDEN event, the
++        human assertion unrecorded, and the file never removed -- so the next
++        mutating verb, ``route-failure``, refused and the task was stranded
++        again by the verb that exists to unstrand it.
++        """
++        self._interrupted()
++        lock = self._lock("")
++
++        code, output = self._recover()
++
++        self.assertEqual(code, 1)
++        self.assertIn("locked", output)
++        self.assertTrue(lock.is_file())
++        self.assertEqual(self.read_state()["status"], "IMPLEMENTING")
++
++        code, _ = self._recover(
++            **{
++                orch.RECOVER_LOCK_OVERRIDE_ENV: "mayank",
++                orch.RECOVER_ASSERTER_ENV: "mayank",
++            }
++        )
++
++        self.assertEqual(code, 0)
++
++        overrides = [
++            e for e in self.events() if e["event"] == "RECOVERY_LOCK_OVERRIDDEN"
++        ]
++
++        self.assertEqual(len(overrides), 1)
++        self.assertEqual(overrides[0]["asserted_by"], "mayank")
++        self.assertEqual(overrides[0]["assertion"], "human")
++        self.assertTrue(overrides[0]["lock_removed"])
++
++        interrupted = [
++            e
++            for e in self.events()
++            if e["event"] == "IMPLEMENTATION_INTERRUPTED"
++        ]
++
++        self.assertTrue(interrupted[-1]["lock_overridden"])
++        # Removed, so route-failure -- the whole point of moving to FAILED --
++        # can take the lock it needs.
++        self.assertFalse(lock.is_file())
++
++    def test_a_lock_that_cannot_be_removed_is_reported_not_swallowed(self):
++        """Telling the developer it was removed is the failure mode here.
++
++        The removal fails precisely when another process still holds the file
++        open -- the case the override was wrong about -- and the next mutating
++        verb then refuses on a lock the developer was told had gone.
++        """
++        self._interrupted()
++        self._lock()
++
++        def refuse(*args, **kwargs):
++            raise PermissionError(13, "in use by another process")
++
++        with mock.patch.object(orch.Path, "unlink", side_effect=refuse):
++            code, output = self._recover(
++                **{orch.RECOVER_LOCK_OVERRIDE_ENV: "mayank"}
++            )
++
++        self.assertEqual(code, 0)
++        self.assertIn("could not be removed", output)
++        self.assertNotIn("  Removed ", output)
++
++        overrides = [
++            e for e in self.events() if e["event"] == "RECOVERY_LOCK_OVERRIDDEN"
++        ]
++
++        self.assertFalse(overrides[0]["lock_removed"])
++
++    def test_a_blank_override_is_not_an_assertion(self):
++        self._interrupted()
++        self._lock()
++
++        code, output = self._recover(
++            **{orch.RECOVER_LOCK_OVERRIDE_ENV: "   "}
++        )
++
++        self.assertEqual(code, 1)
++        self.assertIn("locked", output)
++
++
++class RecoverValidationRouteTests(RecoverCase):
++    """A recovered task reaches VALIDATED only by validating.
++
++    "Recovery emits no validation event" would not settle this. What settles it
++    is driving the route afterwards and watching where VALIDATED comes from.
++    """
++
++    def _profile(self, count=3):
++        stderr = "Ran %d tests in 0.01s\\n\\nOK\\n" % count
++        (self.tmp / ".ai").mkdir(exist_ok=True)
++        (self.tmp / ".ai" / "validation.json").write_text(
++            json.dumps(
++                {
++                    "checks": [
++                        {
++                            "name": "tests",
++                            "command": '{python} -c "import sys; '
++                            "sys.stderr.write('%s')\"" % stderr,
++                            "required": True,
++                            "expect_test_count": True,
++                        }
++                    ]
++                }
++            )
++        )
++
++    def test_recovered_task_requires_validation_before_validated(self):
++        self.write_requirement()
++        self.write_plan("plan.json", PLAN_BODY)
++        self.write_state(status="AWAITING_APPROVAL")
++
++        with quiet():
++            orch.approve_plan(self.task_id)
++
++        self.write_state(status="IMPLEMENTING")
++        orch.record_event(
++            self.task_id, "IMPLEMENTATION_STARTED", worker="claude",
++            mode="implement",
++        )
++        self.init_git()
++        # The validation profile is fixture scaffolding, so it has to exist
++        # before the baseline is captured: a file written afterwards counts as
++        # task-produced and an undeclared .ai/validation.json would fail the
++        # scope check for a reason that has nothing to do with recovery.
++        self._profile()
++        self.write_baseline()
++
++        self.assertEqual(self._recover()[0], 0)
++        self.assertEqual(self.read_state()["status"], "FAILED")
++
++        # Routing cannot hand out VALIDATED either.
++        with mock.patch.object(
++            orch,
++            "classify_failure_with_agent",
++            return_value=("CLAUDE_FIX", {"source": "test"}),
++        ):
++            with quiet():
++                self.assertEqual(orch.route_failure(self.task_id), 0)
++
++        self.assertEqual(self.read_state()["status"], "IMPLEMENTING")
++        self.assertNotEqual(self.read_state()["status"], "VALIDATED")
++
++        def fake_run(argv, **kwargs):
++            if worker_name(argv) == "claude":
++                (self.tmp / "widget.py").write_text("w = 1\n")
++
++            return mock.Mock(returncode=0, stdout="", stderr="")
++
++        with mock.patch.object(
++            orch, "current_branch", return_value="feature/TASK-999"
++        ), mock.patch.object(orch.subprocess, "run", side_effect=fake_run):
++            with quiet():
++                self.assertEqual(orch.run_fix(self.task_id), 0)
++
++        # Still not VALIDATED, and no validation verdict has been recorded.
++        self.assertEqual(self.read_state()["status"], "VALIDATING")
++        self.assertFalse(
++            [e for e in self.events() if e["event"] == "VALIDATION"]
++        )
++        self.assertFalse((self.task_path / "test-results.json").is_file())
++
++        with quiet():
++            orch.run_validation(self.task_id)
++
++        # VALIDATED arrived from validation, with evidence behind it.
++        self.assertEqual(self.read_state()["status"], "VALIDATED")
++        verdicts = [e for e in self.events() if e["event"] == "VALIDATION"]
++        self.assertTrue(verdicts)
++        self.assertTrue(verdicts[-1]["passed"])
++        self.assertTrue((self.task_path / "test-results.json").is_file())
++
++
++def validate_against_schema(instance, schema, path="state"):
++    """A narrow standard-library validator for the task-state schema.
++
++    Deliberately not a general JSON Schema implementation. It supports exactly
++    the keywords this repository's schema uses and **raises** on any it does
++    not recognise, so a schema that grows a construct cannot be silently
++    treated as satisfied. Returns a list of problems.
++    """
++    supported = {
++        "$schema",
++        "title",
++        "description",
++        "type",
++        "required",
++        "properties",
++        "enum",
++        "pattern",
++        "minimum",
++        "additionalProperties",
++    }
++    unsupported = set(schema) - supported
++
++    if unsupported:
++        raise ValueError(
++            "schema at %s uses unsupported keywords: %s"
++            % (path, sorted(unsupported))
++        )
++
++    problems = []
++    types = schema.get("type")
++
++    if types is not None:
++        expected = types if isinstance(types, list) else [types]
++        checkers = {
++            "object": dict,
++            "string": str,
++            "integer": int,
++            "number": (int, float),
++            "boolean": bool,
++            "array": list,
++        }
++
++        unknown = [name for name in expected if name not in checkers
++                   and name != "null"]
++
++        if unknown:
++            raise ValueError("schema at %s uses unknown types: %s"
++                             % (path, unknown))
++
++        def ok(name):
++            if name == "null":
++                return instance is None
++
++            if name in ("integer", "number") and isinstance(instance, bool):
++                return False
++
++            return isinstance(instance, checkers[name])
++
++        if not any(ok(name) for name in expected):
++            problems.append("%s: expected %s, got %s"
++                            % (path, expected, type(instance).__name__))
++            return problems
++
++    if "enum" in schema and instance not in schema["enum"]:
++        problems.append("%s: %r is not one of %s"
++                        % (path, instance, schema["enum"]))
++
++    if "pattern" in schema and isinstance(instance, str):
++        if not re.search(schema["pattern"], instance):
++            problems.append("%s: %r does not match %s"
++                            % (path, instance, schema["pattern"]))
++
++    if "minimum" in schema and isinstance(instance, (int, float)):
++        if instance < schema["minimum"]:
++            problems.append("%s: %r is below %s"
++                            % (path, instance, schema["minimum"]))
++
++    if isinstance(instance, dict):
++        properties = schema.get("properties") or {}
++
++        for key in schema.get("required") or []:
++            if key not in instance:
++                problems.append("%s: required property %r is missing"
++                                % (path, key))
++
++        if schema.get("additionalProperties") is False:
++            for key in sorted(set(instance) - set(properties)):
++                problems.append("%s: property %r is not permitted"
++                                % (path, key))
++
++        for key, value in sorted(instance.items()):
++            if key in properties:
++                problems.extend(
++                    validate_against_schema(
++                        value, properties[key], "%s.%s" % (path, key)
++                    )
++                )
++
++    return problems
++
++
++class RecoverStateSchemaTests(RecoverCase):
++    """Recovery metadata belongs in events.jsonl, and that is checked.
++
++    ``task-state.schema.json`` sets ``additionalProperties: false``, so a
++    ``recovered_at`` or ``recovered_by`` field in state.json would ship fine
++    and fail state validation a week later. A documented decision that nothing
++    checks is how that happens.
++    """
++
++    def test_post_recovery_state_validates_against_repository_schema(self):
++        self._interrupted()
++
++        self.assertEqual(
++            self._recover(**{orch.RECOVER_ASSERTER_ENV: "mayank"})[0], 0
++        )
++
++        # The real schema in the repo, not a copy in the temp tree. A missing
++        # or unparsable schema fails here rather than skipping.
++        schema = json.loads(STATE_SCHEMA.read_text(encoding="utf-8"))
++        state = self.read_state()
++
++        self.assertIs(schema.get("additionalProperties"), False)
++        self.assertEqual(validate_against_schema(state, schema), [])
++
++        # And the attribution really is in the trail rather than in the state.
++        self.assertNotIn("recovered_by", state)
++        interrupted = [
++            e
++            for e in self.events()
++            if e["event"] == "IMPLEMENTATION_INTERRUPTED"
++        ]
++        self.assertEqual(interrupted[-1]["asserted_by"], "mayank")
++
++    def test_the_validator_rejects_an_undeclared_field(self):
++        """Otherwise the check above could pass against anything."""
++        schema = json.loads(STATE_SCHEMA.read_text(encoding="utf-8"))
++        state = {
++            "task_id": "TASK-999",
++            "status": "FAILED",
++            "created_at": "x",
++            "updated_at": "y",
++            "recovered_at": "z",
++        }
++
++        problems = validate_against_schema(state, schema)
++
++        self.assertTrue(any("recovered_at" in p for p in problems), problems)
++
++    def test_the_validator_refuses_an_unsupported_schema_construct(self):
++        with self.assertRaises(ValueError):
++            validate_against_schema({}, {"type": "object", "oneOf": []})
++
++
++class RecoverCliDispatchTests(RecoverCase):
++    """Drive the real CLI, in a subprocess, through real argument parsing.
++
++    Every other criterion here calls a function this suite also authored. A
++    unit test that patches internals passes happily while argument parsing,
++    command registration or dispatch is broken -- the failure mode that hid
++    four separate defects before `preflight` existed.
++    """
++
++    def _cli(self, *args, env=None):
++        environment = dict(os.environ)
++
++        for key in RECOVERY_ENV_KEYS:
++            environment.pop(key, None)
++
++        environment.update(env or {})
++
++        return subprocess.run(
++            [sys.executable, str(ORCHESTRATOR), self.task_id] + list(args),
++            cwd=str(self.tmp),
++            capture_output=True,
++            text=True,
++            encoding="utf-8",
++            env=environment,
++            timeout=120,
++        )
++
++    def test_recover_dispatches_through_real_cli(self):
++        self._interrupted()
++
++        first = self._cli(
++            "recover",
++            "the implementer process was killed",
++            env={orch.RECOVER_ASSERTER_ENV: "mayank"},
++        )
++
++        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
++        self.assertEqual(self.read_state()["status"], "FAILED")
++        self.assertIn(
++            "interrupted-implementation", self.read_state()["failure_reason"]
++        )
++
++        interrupted = [
++            e
++            for e in self.events()
++            if e["event"] == "IMPLEMENTATION_INTERRUPTED"
++        ]
++        self.assertEqual(interrupted[-1]["asserted_by"], "mayank")
++
++        # The same command a second time is now ineligible -- the task is
++        # FAILED -- and the CLI must say so with a non-zero exit.
++        second = self._cli("recover", "again")
++
++        self.assertNotEqual(second.returncode, 0)
++        self.assertIn("cannot be recovered", second.stdout + second.stderr)
++
++    def test_recover_without_a_reason_exits_non_zero_through_the_cli(self):
++        self._interrupted()
++
++        result = self._cli("recover")
++
++        self.assertNotEqual(result.returncode, 0)
++        self.assertIn("needs a reason", result.stdout + result.stderr)
++        self.assertEqual(self.read_state()["status"], "IMPLEMENTING")
++
++
++def documented_verbs(text):
++    """The verb list CLAUDE.md publishes, parsed out of its fenced block."""
++    match = re.search(r"^## Verbs\s*\n+```\n(.*?)\n```", text,
++                      re.MULTILINE | re.DOTALL)
++
++    if match is None:
++        raise ValueError("CLAUDE.md has no fenced verb list under '## Verbs'")
++
++    return {
++        token.strip()
++        for token in match.group(1).replace("\n", " ").split("|")
++        if token.strip()
++    }
++
++
++def documented_implementing_exits(text):
++    """The exits from IMPLEMENTING that CLAUDE.md claims."""
++    match = re.search(
++        r"^- `IMPLEMENTING` exits: (.+?)\.\s", text, re.MULTILINE
++    )
++
++    if match is None:
++        raise ValueError(
++            "CLAUDE.md does not state which verbs exit IMPLEMENTING"
++        )
++
++    return set(re.findall(r"`([a-z-]+)`", match.group(1)))
++
++
++class DocumentedLifecycleContractTests(TaskDirCase):
++    """A documented contract that contradicts the code is a defect.
++
++    Parsed rather than grepped: "recover" already appears in orchestrator.py as
++    "recoverable" and "recovered", so a substring check is satisfied by an
++    incidental mention. These compare a parsed contract against dispatch, and
++    then drive the dispatch.
++    """
++
++    def test_documented_verbs_and_implementing_exits_match_dispatch(self):
++        text = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
++
++        self.assertEqual(documented_verbs(text), orch.dispatchable_verbs())
++
++        exits = documented_implementing_exits(text)
++        self.assertEqual(exits, set(orch.IMPLEMENTING_EXITS))
++
++        for verb in exits:
++            self.assertTrue(
++                verb in orch.ACTIONS or verb in orch.TEXT_ACTIONS,
++                "%s is documented as an exit but is not dispatchable" % verb,
++            )
++
++        # Now the behaviour, not the table: the documented exits are the verbs
++        # whose status gate accepts IMPLEMENTING, and nothing else's does.
++        self.write_requirement()
++        self.write_plan("plan.json", PLAN_BODY)
++        self.write_state(status="IMPLEMENTING")
++
++        refusals = {}
++
++        for verb, handler in (
++            ("implement", orch.run_implementation),
++            ("validate", orch.run_validation),
++            ("replan", orch.run_replan),
++            ("route-failure", orch.route_failure),
++            ("approve", orch.approve_plan),
++        ):
++            with quiet() as out:
++                code = handler(self.task_id)
++
++            refusals[verb] = (code, out.getvalue())
++
++        for verb, (code, output) in refusals.items():
++            self.assertEqual(code, 1, verb)
++            self.assertIn("is in state IMPLEMENTING", output, verb)
++
++        # `fix` and `recover` get past the status gate and refuse for their own
++        # reasons instead -- which is what "exits IMPLEMENTING" means.
++        with quiet() as out:
++            self.assertEqual(orch.run_fix(self.task_id), 1)
++
++        self.assertIn("no CLAUDE_FIX_STARTED event", out.getvalue())
++
++        with quiet() as out:
++            self.assertEqual(orch.run_recover(self.task_id, "killed"), 1)
++
++        self.assertIn("no IMPLEMENTATION_STARTED", out.getvalue())
++
++    def test_the_verb_parser_fails_on_input_it_cannot_read(self):
++        """So a reformatted or missing section fails rather than passing."""
++        with self.assertRaises(ValueError):
++            documented_verbs("# CLAUDE\n\nno verbs here\n")
++
++        with self.assertRaises(ValueError):
++            documented_implementing_exits("nothing about implementing\n")
++
++
++class RecoverDispatchTests(unittest.TestCase):
++    def test_recover_is_a_dispatchable_text_verb(self):
++        self.assertIn("recover", orch.TEXT_ACTIONS)
++        self.assertIs(orch.TEXT_ACTIONS["recover"], orch.run_recover)
++
++    def test_recover_does_not_take_the_task_lock(self):
++        """Its subject is a leftover lock; taking one would mask it."""
++        self.assertIn("recover", orch.UNLOCKED_ACTIONS)
++        self.assertNotIn("recover", orch.ACTIONS)
++
++    def test_usage_documents_recover(self):
++        self.assertIn("recover", orch.USAGE)
++
++
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/test_task_baseline.py b/test_task_baseline.py
 new file mode 100644
-index 0000000..73827f8
+index 0000000..63d136f
 --- /dev/null
 +++ b/test_task_baseline.py
-@@ -0,0 +1,841 @@
+@@ -0,0 +1,1202 @@
 +"""The task baseline and the delta computed against it.
 +
 +The workflow could not previously tell a change a task produced from an
@@ -15881,6 +19362,79 @@ index 0000000..73827f8
 +
 +HAVE_GIT = shutil.which("git") is not None
 +
++# One prepared starting repository per task id, copied into each test's own
++# temp tree. Building it took six git subprocesses per test method -- about
++# 0.4s on Windows against 0.05s for the copy -- which made this module the
++# largest single contributor to suite wall time, and AC-16 runs the whole
++# suite inside a bounded acceptance timeout. The copy is a real repository
++# with the same HEAD, branch and starting tree, so no test sees a different
++# fixture than it did before.
++_TEMPLATE_REPOS = {}
++
++
++def _git_in(root, *args):
++    subprocess.run(
++        ["git"] + list(args),
++        cwd=str(root),
++        capture_output=True,
++        check=True,
++    )
++
++
++def _write_profile(root, count=4):
++    """The validation profile the fixture starts with.
++
++    Shared by the template and by tests that re-write it with a different
++    expected test count, so there is one definition of the starting profile.
++    """
++    stderr = "Ran %d tests in 0.01s\\n\\nOK\\n" % count
++    (root / ".ai").mkdir(exist_ok=True)
++    (root / ".ai" / "validation.json").write_text(
++        json.dumps(
++            {
++                "checks": [
++                    {
++                        "name": "tests",
++                        "command": '{python} -c "import sys; '
++                        "sys.stderr.write('%s')\"" % stderr,
++                        "required": True,
++                        "expect_test_count": True,
++                    }
++                ]
++            }
++        )
++    )
++
++
++def _build_starting_repo(root, task_id):
++    _git_in(root, "init", "-q", "-b", "main")
++    _git_in(root, "config", "user.email", "t@example.com")
++    _git_in(root, "config", "user.name", "T")
++    (root / "base.txt").write_text("base\n")
++    # Part of the starting tree, like the real .ai/validation.json: written
++    # before the baseline, so it is pre-existing rather than task-produced.
++    _write_profile(root)
++    _git_in(root, "add", "-A")
++    _git_in(root, "commit", "-qm", "base")
++    _git_in(root, "checkout", "-q", "-b", "feature/%s" % task_id)
++
++
++def _template_repo(task_id):
++    root = _TEMPLATE_REPOS.get(task_id)
++
++    if root is None:
++        root = Path(tempfile.mkdtemp(prefix="wf-template-"))
++        _build_starting_repo(root, task_id)
++        _TEMPLATE_REPOS[task_id] = root
++
++    return root
++
++
++def tearDownModule():
++    while _TEMPLATE_REPOS:
++        _, root = _TEMPLATE_REPOS.popitem()
++        shutil.rmtree(root, ignore_errors=True)
++
 +
 +class BaselineCase(TaskDirCase):
 +    """A task workspace inside a real git repo.
@@ -15893,24 +19447,18 @@ index 0000000..73827f8
 +    def setUp(self):
 +        super().setUp()
 +
-+        self._git("init", "-q", "-b", "main")
-+        self._git("config", "user.email", "t@example.com")
-+        self._git("config", "user.name", "T")
-+        (self.tmp / "base.txt").write_text("base\n")
-+        # Part of the starting tree, like the real .ai/validation.json: written
-+        # before the baseline, so it is pre-existing rather than task-produced.
-+        self._profile()
-+        self._git("add", "-A")
-+        self._git("commit", "-qm", "base")
-+        self._git("checkout", "-q", "-b", "feature/%s" % self.task_id)
++        template = _template_repo(self.task_id)
++
++        for entry in sorted(template.iterdir()):
++            target = self.tmp / entry.name
++
++            if entry.is_dir():
++                shutil.copytree(entry, target, dirs_exist_ok=True)
++            else:
++                shutil.copy2(entry, target)
 +
 +    def _git(self, *args):
-+        subprocess.run(
-+            ["git"] + list(args),
-+            cwd=str(self.tmp),
-+            capture_output=True,
-+            check=True,
-+        )
++        _git_in(self.tmp, *args)
 +
 +    def _plan(self, name="plan.json", modify=(), create=(), criteria=None):
 +        body = {
@@ -15924,23 +19472,7 @@ index 0000000..73827f8
 +        return self.write_plan(name, plan_json(**body))
 +
 +    def _profile(self, count=4):
-+        stderr = "Ran %d tests in 0.01s\\n\\nOK\\n" % count
-+        (self.tmp / ".ai").mkdir(exist_ok=True)
-+        (self.tmp / ".ai" / "validation.json").write_text(
-+            json.dumps(
-+                {
-+                    "checks": [
-+                        {
-+                            "name": "tests",
-+                            "command": '{python} -c "import sys; '
-+                            "sys.stderr.write('%s')\"" % stderr,
-+                            "required": True,
-+                            "expect_test_count": True,
-+                        }
-+                    ]
-+                }
-+            )
-+        )
++        _write_profile(self.tmp, count)
 +
 +    def _capture(self, plan_version=1):
 +        return orch.capture_baseline(
@@ -16656,6 +20188,316 @@ index 0000000..73827f8
 +
 +    def test_the_provenance_fields_are_optional(self):
 +        self.assertEqual(orch.validate_plan(json.loads(plan_json())), [])
++
++
++@unittest.skipUnless(HAVE_GIT, "git not available")
++class ForeignTaskDeltaTests(BaselineCase):
++    """One task's work must not become another task's scope violation.
++
++    The delta is still the whole tree -- what changes is attribution. A task's
++    delta used to grow for as long as the task stayed open, so two tasks could
++    not be in flight at once and an interrupted task made the tree unusable for
++    anything else.
++
++    Ownership is structural: another open task's recorded worktree, or its
++    ``.ai/tasks/<id>/`` directory. Deliberately not the paths another task's
++    plan declares, because that would make one task's plan an authorisation
++    input for another task's validation.
++    """
++
++    OTHER = "TASK-998"
++
++    def setUp(self):
++        super().setUp()
++        self._capture()
++        self.write_state(status="VALIDATING")
++        self._plan(create=("widget.py",))
++        (self.tmp / "widget.py").write_text("w = 1\n")
++
++    def _other_task(self, status="IMPLEMENTING", worktree="sandboxes/TASK-998"):
++        """A second task, open, with a recorded worktree inside this tree.
++
++        Recorded somewhere the manifest still enumerates: the conventional
++        ``.worktrees/`` location is excluded from the manifest outright, so a
++        fixture there would prove nothing about classification.
++        """
++        directory = self.tmp / ".ai" / "tasks" / self.OTHER
++        directory.mkdir(parents=True, exist_ok=True)
++        (directory / "state.json").write_text(
++            json.dumps(
++                {
++                    "task_id": self.OTHER,
++                    "status": status,
++                    "created_at": "2026-09-01T10:00:00+05:30",
++                    "updated_at": "2026-09-01T10:00:00+05:30",
++                    "plan_version": 1,
++                    "branch": "feature/%s" % self.OTHER,
++                    "worktree": worktree,
++                    "failure_reason": None,
++                }
++            )
++        )
++
++        if worktree:
++            (self.tmp / worktree).mkdir(parents=True, exist_ok=True)
++
++        return directory
++
++    def _scope(self):
++        with quiet():
++            code = orch.run_validation(self.task_id)
++
++        return code, self._evidence()["diff_scope"]
++
++    def test_other_open_task_paths_are_foreign_not_violations(self):
++        self._other_task()
++        # Task B's work, in task B's recorded worktree, while task A validates.
++        (self.tmp / "sandboxes" / "TASK-998" / "widget.py").write_text("b = 1\n")
++
++        code, scope = self._scope()
++
++        self.assertEqual(code, 0)
++        self.assertEqual(
++            [entry["path"] for entry in scope["foreign"]],
++            ["sandboxes/TASK-998/widget.py"],
++        )
++        self.assertEqual(scope["foreign"][0]["owner"], self.OTHER)
++        self.assertNotIn("sandboxes/TASK-998/widget.py", scope["violations"])
++        self.assertEqual(scope["violations"], [])
++
++        # Task B's own task directory is owned structurally too, and no plan of
++        # task B's was consulted to establish either: B has an approved plan
++        # here declaring a file, and it makes no difference to A's result.
++        mine, foreign = orch.classify_foreign_paths(
++            self.task_id,
++            [
++                ".ai/tasks/%s/implementation.md" % self.OTHER,
++                "sandboxes/TASK-998/nested/deep.py",
++                "widget.py",
++            ],
++        )
++
++        self.assertEqual(mine, ["widget.py"])
++        self.assertEqual(
++            sorted(entry["path"] for entry in foreign),
++            [
++                ".ai/tasks/%s/implementation.md" % self.OTHER,
++                "sandboxes/TASK-998/nested/deep.py",
++            ],
++        )
++
++    def test_ownership_respects_path_component_boundaries(self):
++        """An over-broad prefix would hide a real violation."""
++        self._other_task()
++
++        mine, foreign = orch.classify_foreign_paths(
++            self.task_id,
++            ["sandboxes/TASK-9980/x.py", "sandboxes/TASK-998-notes.py"],
++        )
++
++        self.assertEqual(foreign, [])
++        self.assertEqual(
++            mine, ["sandboxes/TASK-9980/x.py", "sandboxes/TASK-998-notes.py"]
++        )
++
++    def test_a_completed_task_owns_nothing(self):
++        """Its paths are ordinary tree contents again."""
++        self._other_task(status="COMPLETED")
++        (self.tmp / "sandboxes" / "TASK-998" / "widget.py").write_text("b = 1\n")
++
++        code, scope = self._scope()
++
++        self.assertNotEqual(code, 0)
++        self.assertIn("sandboxes/TASK-998/widget.py", scope["violations"])
++        self.assertEqual(scope["foreign"], [])
++
++    def test_another_tasks_plan_is_never_read(self):
++        """The accepted residual case, asserted so it stays deliberate.
++
++        A concurrent open task with **no** recorded worktree that edits shared
++        source is not structurally attributable, so its change still lands in
++        this task's delta as a violation. Subtracting the paths task B's plan
++        declares would fix that and would also let one task's plan widen a
++        scope check it was never reviewed against. This is the trade decision 2
++        made, and it is recorded here rather than discovered later.
++        """
++        directory = self._other_task(worktree=None)
++        (directory / "plan.json").write_text(
++            plan_json(
++                files_to_modify=[{"path": "base.txt", "purpose": "task B's"}]
++            )
++        )
++        (self.tmp / "base.txt").write_text("edited by task B\n")
++
++        code, scope = self._scope()
++
++        self.assertNotEqual(code, 0)
++        self.assertIn("base.txt", scope["violations"])
++        self.assertEqual(scope["foreign"], [])
++
++
++@unittest.skipUnless(HAVE_GIT, "git not available")
++class CommittedEvidenceTests(BaselineCase):
++    """Committed corroboration starts at the baseline, not at the fork point.
++
++    ``resolve_diff_base`` returns merge-base(main, HEAD). On a feature branch
++    several commits ahead that is the fork point, so ``committed_changed``
++    listed everything the branch had ever carried -- 74 files for TASK-007,
++    none of which that task produced. Non-blocking, but noise shaped like
++    evidence.
++    """
++
++    def setUp(self):
++        super().setUp()
++
++        # Several commits beyond the fork, none of them this task's work.
++        for name in ("history_one.txt", "history_two.txt"):
++            (self.tmp / name).write_text("%s\n" % name)
++            self._git("add", "-A")
++            self._git("commit", "-qm", "branch work: %s" % name)
++
++        self.write_state(status="VALIDATING")
++        self._plan(create=("widget.py",))
++
++    def test_committed_changes_begin_at_baseline_head(self):
++        baseline = self._capture()
++        head = baseline["git"]["head"]
++
++        # The fixture really is several commits past the fork, so the two bases
++        # are different questions with different answers.
++        self.assertNotEqual(head, orch.resolve_diff_base())
++
++        (self.tmp / "widget.py").write_text("w = 1\n")
++        # Only the source file: `add -A` would sweep the task's own evidence
++        # into the commit, where it would look like task-produced source.
++        self._git("add", "widget.py")
++        self._git("commit", "-qm", "the task's own commit")
++
++        with quiet():
++            code = orch.run_validation(self.task_id)
++
++        scope = self._evidence()["diff_scope"]
++
++        self.assertEqual(code, 0)
++        self.assertEqual(scope["base"], head)
++        self.assertEqual(scope["committed_changed"], ["widget.py"])
++        # The branch's earlier history is not this task's evidence.
++        self.assertNotIn("history_one.txt", scope["committed_changed"])
++        self.assertNotIn("history_two.txt", scope["committed_changed"])
++        self.assertNotIn("base.txt", scope["committed_changed"])
++
++    def test_missing_baseline_head_omits_committed_changed(self):
++        """Manifests written before this existed simply do not have it.
++
++        Omitting the evidence is honest; substituting merge-base is what this
++        change removed.
++        """
++        self.write_baseline()
++        (self.tmp / "widget.py").write_text("w = 1\n")
++
++        with quiet():
++            code = orch.run_validation(self.task_id)
++
++        scope = self._evidence()["diff_scope"]
++
++        self.assertEqual(code, 0)
++        self.assertIsNone(orch.baseline_head(orch.load_baseline(self.task_id)))
++        self.assertNotIn("committed_changed", scope)
++        self.assertNotIn("base", scope)
++        self.assertIn("no git.head", scope["committed_evidence_omitted"])
++
++
++@unittest.skipUnless(HAVE_GIT, "git not available")
++class RecordedWorktreeDeltaTests(BaselineCase):
++    """The recorded worktree is where the task's tree evidence comes from."""
++
++    def setUp(self):
++        super().setUp()
++
++        self.worktree = self.tmp / ".worktrees" / self.task_id
++        self._git(
++            "worktree", "add", "-q", str(self.worktree), "-b",
++            "wt/%s" % self.task_id,
++        )
++        self.write_state(
++            status="VALIDATING", worktree=".worktrees/%s" % self.task_id
++        )
++        self._plan(create=("widget.py",))
++
++    def test_git_and_delta_evidence_use_recorded_worktree(self):
++        # The task's real state, so capture roots itself where the task runs.
++        baseline = orch.capture_baseline(
++            self.task_id, orch.load_state(self.task_id)[1]
++        )
++
++        # Git corroboration is the worktree's, not the checkout's: the two are
++        # on different branches on purpose.
++        self.assertEqual(baseline["git"]["head"], orch.git_head(self.worktree))
++        self.assertEqual(baseline["git"]["branch"], "wt/%s" % self.task_id)
++        self.assertNotEqual(orch.current_branch(), baseline["git"]["branch"])
++        # The evidence itself stays single-homed in the orchestrator checkout.
++        self.assertTrue((self.task_path / "baseline.json").is_file())
++
++        (self.worktree / "widget.py").write_text("w = 1\n")
++        # A change in the checkout is not this task's work: the task runs in
++        # its worktree, so the delta must not see this at all.
++        (self.tmp / "decoy.py").write_text("d = 1\n")
++
++        delta = orch.compute_task_delta(
++            baseline, orch.execution_root(self.task_id)
++        )
++
++        self.assertEqual(delta["created"], ["widget.py"])
++        self.assertNotIn("decoy.py", delta["created"])
++
++        with quiet():
++            code = orch.run_validation(self.task_id)
++
++        scope = self._evidence()["diff_scope"]
++
++        self.assertEqual(code, 0)
++        self.assertEqual(scope["changed"], ["widget.py"])
++        self.assertEqual(scope["violations"], [])
++
++
++@unittest.skipUnless(HAVE_GIT, "git not available")
++class LegacyTaskRootTests(BaselineCase):
++    """Every task that exists today has ``"worktree": null``.
++
++    Including TASK-008 itself. The orchestrator checkout is the fallback for
++    both launching and evidence, so those tasks stay drivable.
++    """
++
++    def setUp(self):
++        super().setUp()
++        self.write_state(status="VALIDATING", worktree=None)
++        self._plan(create=("widget.py",))
++
++    def test_task_without_worktree_uses_orchestrator_checkout(self):
++        self.assertEqual(
++            orch.execution_root(self.task_id).resolve(), self.tmp.resolve()
++        )
++
++        baseline = self._capture()
++
++        self.assertIn("base.txt", baseline["entries"])
++        self.assertEqual(baseline["git"]["head"], orch.git_head())
++
++        (self.tmp / "widget.py").write_text("w = 1\n")
++
++        with quiet():
++            code = orch.run_validation(self.task_id)
++
++        evidence = self._evidence()
++
++        self.assertEqual(code, 0)
++        self.assertEqual(evidence["task_delta"]["created"], ["widget.py"])
++        self.assertEqual(evidence["diff_scope"]["violations"], [])
++        # Readable afterwards, which is the other half of "remains drivable".
++        self.assertEqual(
++            orch.load_baseline(self.task_id)["baseline_sha256"],
++            baseline["baseline_sha256"],
++        )
 +
 +
 +class ProtectedEvidenceTests(unittest.TestCase):
@@ -17831,10 +21673,10 @@ index 0000000..1f78e9b
 +    unittest.main()
 diff --git a/test_worker_launch.py b/test_worker_launch.py
 new file mode 100644
-index 0000000..eec728e
+index 0000000..494c728
 --- /dev/null
 +++ b/test_worker_launch.py
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,582 @@
 +"""Launching the worker CLIs for real.
 +
 +Every other test in this suite mocks ``subprocess.run``, which is the right
@@ -17857,9 +21699,10 @@ index 0000000..eec728e
 +import shutil
 +import subprocess
 +import unittest
++from pathlib import Path
 +from unittest import mock
 +
-+from _support import TaskDirCase, load_orchestrator
++from _support import TaskDirCase, load_orchestrator, plan_json, quiet
 +
 +orch = load_orchestrator()
 +
@@ -17962,6 +21805,34 @@ index 0000000..eec728e
 +
 +        self.assertEqual(usage[0]["worker"], "codex")
 +
++    def test_worker_name_is_host_independent(self):
++        """The two tests above pass on the host that cannot detect the bug.
++
++        `run_worker` originally reduced argv[0] with `Path(...).stem`, and
++        `Path` is whatever the host is. On Windows that handles both
++        separators, so a Windows path and a POSIX path both reduced correctly
++        and the pair above went green -- while on Linux `Path` is a
++        PurePosixPath that does not split on `\\`, so the same code recorded
++        `worker: C:\\Users\\...\\npm\\claude` and CI failed on a tree that had
++        passed local validation.
++
++        So the obligation is asserted directly on the reduction, over both
++        separator styles at once. This fails on every platform if the flavour
++        goes back to being the host's.
++        """
++        cases = [
++            (r"C:\Users\x\AppData\Roaming\npm\claude.CMD", "claude"),
++            (r"C:\npm\codex.CMD", "codex"),
++            ("/usr/local/bin/codex", "codex"),
++            ("/home/runner/.npm-global/bin/claude", "claude"),
++            ("claude", "claude"),
++            ("codex", "codex"),
++        ]
++
++        for argv0, expected in cases:
++            with self.subTest(argv0=argv0):
++                self.assertEqual(orch.worker_name(argv0), expected)
++
 +    def test_missing_worker_is_reported_by_name_not_by_path(self):
 +        with mock.patch.object(
 +            orch.subprocess, "run", side_effect=FileNotFoundError()
@@ -17997,6 +21868,342 @@ index 0000000..eec728e
 +
 +        self.assertIsNone(data)
 +        self.assertIn("not found on PATH", error)
++
++
++class ExecutionRootCase(TaskDirCase):
++    """Where a task's subprocesses actually run.
++
++    ``run_worktree`` created a tree and recorded it in ``state["worktree"]``,
++    and nothing read it as a working directory: every subprocess ran in
++    ``Path.cwd()``, so the stated purpose -- letting tasks run in parallel
++    without fighting over one checkout -- was not delivered.
++    """
++
++    CWD_CRITERION = {
++        "id": "AC-1",
++        "statement": "The acceptance command runs where the task's work is.",
++        "verify": '{python} -c "import os; print(os.getcwd())"',
++    }
++
++    def _task(self, worktree):
++        self.write_requirement()
++        plan = self.write_plan(
++            "plan.json", plan_json(acceptance_criteria=[self.CWD_CRITERION])
++        )
++        _, state = self.write_state(
++            status="IMPLEMENTING", worktree=worktree, plan_file=str(plan)
++        )
++        return state
++
++    def _launch(self):
++        """Run a worker with subprocess doubled; report cwd and environment."""
++        seen = {}
++
++        def fake_run(argv, **kwargs):
++            seen["cwd"] = kwargs.get("cwd")
++            seen["env"] = kwargs.get("env")
++            return mock.Mock(returncode=0, stdout=None, stderr=None)
++
++        with mock.patch.object(orch.subprocess, "run", side_effect=fake_run):
++            orch.run_worker(["claude", "--print"], 10, task_id=self.task_id)
++
++        return seen
++
++    def _acceptance_cwd(self, state):
++        """Where an acceptance command really ran. Not mocked: it is the point."""
++        summary = orch.evaluate_acceptance_criteria(self.task_id, state)
++
++        self.assertEqual(summary["total"], 1, summary)
++        printed = summary["results"][0]["output"].strip().splitlines()[-1]
++
++        return Path(printed).resolve()
++
++
++class RecordedWorktreeExecutionTests(ExecutionRootCase):
++    def test_worker_and_acceptance_commands_use_recorded_worktree(self):
++        tree = self.tmp / ".worktrees" / self.task_id
++        tree.mkdir(parents=True)
++        state = self._task(".worktrees/%s" % self.task_id)
++
++        seen = self._launch()
++
++        self.assertEqual(Path(seen["cwd"]).resolve(), tree.resolve())
++        self.assertEqual(self._acceptance_cwd(state), tree.resolve())
++
++        # The worker runs in its worktree; the evidence it reads is the
++        # checkout's. Both are exported, because a cwd-relative hook command
++        # executes the worktree's copy of the hook and that copy would
++        # otherwise resolve .ai/tasks/<id> against the wrong tree.
++        env = seen["env"]
++
++        self.assertEqual(
++            Path(env["ORCHESTRATOR_WORKER_ROOT"]).resolve(), tree.resolve()
++        )
++        self.assertEqual(
++            Path(env["ORCHESTRATOR_REPO_ROOT"]).resolve(), self.tmp.resolve()
++        )
++        self.assertEqual(
++            Path(env["ORCHESTRATOR_TASK_DIR"]).resolve(),
++            self.task_path.resolve(),
++        )
++        self.assertEqual(
++            Path(env["ORCHESTRATOR_CONSTITUTION"]).resolve(),
++            (self.tmp / ".ai" / "constitution.md").resolve(),
++        )
++        self.assertEqual(env["ORCHESTRATOR_TASK_ID"], self.task_id)
++
++    def test_an_absolute_recorded_worktree_is_honoured(self):
++        tree = self.tmp / "elsewhere" / self.task_id
++        tree.mkdir(parents=True)
++        state = self._task(str(tree))
++
++        self.assertEqual(
++            Path(self._launch()["cwd"]).resolve(), tree.resolve()
++        )
++        self.assertEqual(self._acceptance_cwd(state), tree.resolve())
++
++    def test_a_recorded_worktree_that_is_gone_falls_back(self):
++        """Fail closed onto the checkout rather than into a missing directory.
++
++        A recorded path can be stale: the worktree may have been removed on
++        another machine, or the record may predate a move. Rooting a subprocess
++        at something that is not there fails with an OS error that says nothing
++        about tasks.
++        """
++        state = self._task(".worktrees/gone")
++
++        self.assertEqual(
++            Path(self._launch()["cwd"]).resolve(), self.tmp.resolve()
++        )
++        self.assertEqual(self._acceptance_cwd(state), self.tmp.resolve())
++
++
++class LegacyCheckoutExecutionTests(ExecutionRootCase):
++    """The path every task that exists today runs on.
++
++    Including TASK-008 itself, whose own state.json has ``"worktree": null``:
++    a regression here would break the task doing the work.
++    """
++
++    def test_null_worktree_worker_and_acceptance_use_orchestrator_checkout(
++        self,
++    ):
++        state = self._task(None)
++
++        seen = self._launch()
++
++        self.assertEqual(Path(seen["cwd"]).resolve(), self.tmp.resolve())
++        self.assertEqual(self._acceptance_cwd(state), self.tmp.resolve())
++
++        env = seen["env"]
++
++        self.assertEqual(
++            Path(env["ORCHESTRATOR_WORKER_ROOT"]).resolve(), self.tmp.resolve()
++        )
++        self.assertEqual(
++            Path(env["ORCHESTRATOR_REPO_ROOT"]).resolve(), self.tmp.resolve()
++        )
++
++    def test_a_blank_recorded_worktree_is_not_a_directory_name(self):
++        state = self._task("   ")
++
++        self.assertEqual(
++            Path(self._launch()["cwd"]).resolve(), self.tmp.resolve()
++        )
++        self.assertEqual(self._acceptance_cwd(state), self.tmp.resolve())
++
++    def test_worker_env_needs_no_task_state_to_exist(self):
++        """`worker_env(task_id)` is called for ids with no workspace yet.
++
++        ``test_preflight.py`` calls it for TASK-001 in a tree that has no such
++        task at all, so the honest answer for a task with no readable state is
++        the orchestrator checkout -- not an exception.
++        """
++        env = orch.worker_env("TASK-001")
++
++        self.assertEqual(
++            Path(env["ORCHESTRATOR_WORKER_ROOT"]).resolve(),
++            self.tmp.resolve(),
++        )
++        self.assertEqual(env["ORCHESTRATOR_TASK_ID"], "TASK-001")
++        self.assertIsNone(orch.worker_env(None))
++
++
++class WorktreeEvidencePathTests(ExecutionRootCase):
++    """What a worktree-rooted worker is *told* to read and write.
++
++    Rooting execution in the recorded worktree moved the worker's cwd without
++    moving the evidence. ``.ai/tasks/`` is tracked in git, so the worktree
++    carries a committed -- and possibly stale -- copy of the requirement, the
++    plan and the notes. A prompt that names them relatively therefore points the
++    worker at bytes the developer's hash-bound approval does not cover, and its
++    ``implementation.md`` lands where the Stop guard, which reads the exported
++    absolute path, does not look. The planner has the same exposure from the
++    other side: ``--output-last-message`` is where codex writes the plan the
++    orchestrator then looks for in the checkout.
++    """
++
++    def _worktree_task(self, with_plan=True):
++        tree = self.tmp / ".worktrees" / self.task_id
++        tree.mkdir(parents=True)
++        self.write_requirement()
++
++        if with_plan:
++            self.write_plan(
++                "plan.json", plan_json(acceptance_criteria=[self.CWD_CRITERION])
++            )
++
++        _, state = self.write_state(
++            status="IMPLEMENTING", worktree=".worktrees/%s" % self.task_id
++        )
++        return tree, state
++
++    def _prompt_of(self, call):
++        """Run something that invokes a worker; report its prompt and cwd."""
++        seen = {}
++
++        def fake_run(argv, **kwargs):
++            seen["input"] = kwargs.get("input")
++            seen["cwd"] = kwargs.get("cwd")
++            return mock.Mock(returncode=0, stdout=None, stderr=None)
++
++        with mock.patch.object(orch.subprocess, "run", side_effect=fake_run):
++            with quiet():
++                call()
++
++        return seen
++
++    def assertEvidenceIsCheckoutRooted(self, prompt, filename):
++        """Every mention of an evidence file names the checkout's copy.
++
++        Counting occurrences rather than asserting a single ``in`` is what makes
++        this fail on a *second*, relative mention of the same file elsewhere in
++        the prompt.
++        """
++        absolute = str(self.task_path.resolve() / filename)
++
++        self.assertIn(absolute, prompt)
++        self.assertEqual(
++            prompt.count(filename), prompt.count(absolute), prompt
++        )
++
++    def test_implement_prompt_names_checkout_evidence_not_the_worktree_copy(
++        self,
++    ):
++        tree, _ = self._worktree_task()
++        # Relative, as `task_dir` yields it and as state.json may record it.
++        plan_file = orch.task_dir(self.task_id) / "plan.json"
++
++        seen = self._prompt_of(
++            lambda: orch.run_claude_implementation(self.task_id, plan_file)
++        )
++        prompt = seen["input"]
++
++        self.assertEqual(Path(seen["cwd"]).resolve(), tree.resolve())
++
++        for name in (
++            "requirement.md",
++            "plan.json",
++            "implementation.md",
++            "state.json",
++        ):
++            self.assertEvidenceIsCheckoutRooted(prompt, name)
++
++        self.assertNotIn(str(tree.resolve()), prompt)
++
++    def test_fix_prompt_names_checkout_evidence_not_the_worktree_copy(self):
++        tree, state = self._worktree_task()
++        plan_file = orch.task_dir(self.task_id) / "plan.json"
++
++        seen = self._prompt_of(
++            lambda: orch.run_claude_fix(self.task_id, plan_file, state)
++        )
++        prompt = seen["input"]
++
++        self.assertEqual(Path(seen["cwd"]).resolve(), tree.resolve())
++
++        for name in (
++            "requirement.md",
++            "plan.json",
++            "implementation.md",
++            "state.json",
++        ):
++            self.assertEvidenceIsCheckoutRooted(prompt, name)
++
++        self.assertNotIn(str(tree.resolve()), prompt)
++
++    def _planner_output(self, call):
++        """Where the planner was told to write, with codex doubled."""
++        seen = {}
++
++        def fake_run(argv, **kwargs):
++            seen["cwd"] = kwargs.get("cwd")
++            seen["out"] = argv[argv.index("--output-last-message") + 1]
++            Path(seen["out"]).write_text(plan_json(), encoding="utf-8")
++            return mock.Mock(returncode=0, stdout=None, stderr=None)
++
++        with mock.patch.object(orch.subprocess, "run", side_effect=fake_run):
++            with quiet():
++                seen["returned"] = call()
++
++        return seen
++
++    def test_planner_writes_its_plan_into_the_checkout_evidence_directory(self):
++        tree, _ = self._worktree_task(with_plan=False)
++
++        seen = self._planner_output(
++            lambda: orch.run_codex_planning(self.task_id)
++        )
++        out = Path(seen["out"])
++
++        self.assertEqual(Path(seen["cwd"]).resolve(), tree.resolve())
++        self.assertTrue(out.is_absolute(), out)
++        self.assertEqual(out.resolve(), (self.task_path / "plan.json").resolve())
++        self.assertNotIn(tree.resolve(), out.resolve().parents)
++
++        # The path handed to the subprocess is absolute; the path recorded as
++        # evidence stays repo-relative, so events.jsonl and state.json remain
++        # comparable across machines.
++        relative = str(orch.task_dir(self.task_id) / "plan.json")
++
++        self.assertEqual(str(seen["returned"]), relative)
++
++        created = [e for e in self.events() if e["event"] == "PLAN_CREATED"]
++
++        self.assertEqual(created[-1]["plan_file"], relative)
++
++    def test_replan_writes_its_plan_into_the_checkout_evidence_directory(self):
++        tree, state = self._worktree_task(with_plan=False)
++
++        seen = self._planner_output(
++            lambda: orch.run_codex_replan(self.task_id, 2, state=state)
++        )
++        out = Path(seen["out"])
++
++        self.assertEqual(Path(seen["cwd"]).resolve(), tree.resolve())
++        self.assertTrue(out.is_absolute(), out)
++        self.assertEqual(
++            out.resolve(), (self.task_path / "plan-v2.json").resolve()
++        )
++        self.assertNotIn(tree.resolve(), out.resolve().parents)
++        self.assertEqual(
++            str(seen["returned"]),
++            str(orch.task_dir(self.task_id) / "plan-v2.json"),
++        )
++
++    def test_a_legacy_task_still_gets_the_same_checkout_paths(self):
++        """No recorded worktree: both roots coincide and nothing moves."""
++        self.write_requirement()
++        self.write_state(status="IMPLEMENTING", worktree=None)
++        plan_file = orch.task_dir(self.task_id) / "plan.json"
++
++        seen = self._prompt_of(
++            lambda: orch.run_claude_implementation(self.task_id, plan_file)
++        )
++
++        self.assertEqual(Path(seen["cwd"]).resolve(), self.tmp.resolve())
++        self.assertEvidenceIsCheckoutRooted(seen["input"], "requirement.md")
++        self.assertEvidenceIsCheckoutRooted(seen["input"], "plan.json")
 +
 +
 +class LiveWorkerTests(unittest.TestCase):
@@ -18385,7 +22592,7 @@ index 0000000..07f7217
 
 - Command: `C:\Users\manka\AppData\Local\Programs\Python\Python313\python.exe -m unittest -v`
 - Return code: 0
-- Tests run: 729
+- Tests run: 730
 - Result: PASSED
 
 ## Acceptance Criteria
@@ -18432,35 +22639,29 @@ index 0000000..07f7217
 
 ## Reviewer Findings
 
-- **correctness**: 5 finding(s). Examined: .ai/tasks/TASK-008/requirement.md, plan-v4.json and implementation.md (context only); .ai/scripts/orchestrator.py: repo_root/recorded_worktree/execution_root/authoritative_path/evidence_dir/worker_env, run_worker cwd+env, codex_argv and run_codex_planning/run_codex_replan output paths; .ai/scripts/orchestrator.py: last_implementation_attempt, recovery_eligibility, lock_holder, run_recover (reason gate, eligibility ordering, lock existence/override/unlink reporting, event sequence, state write), IMPLEMENTATION_TERMINATING_EVENTS, run_fix preconditions; .ai/scripts/orchestrator.py: run_plan failure handling and fail_planning, critique_file/normalise_critique_issues/persist_critique/critique_round, run_replan critique + failure paths; .ai/scripts/orchestrator.py: leave_failed, last_recorded_failure_reason, route_failure exits, run_validation blocking-vs-foreign handling and VALIDATED path; .ai/scripts/orchestrator.py: baseline_excluded/enumerate_tree/tree_manifest/capture_baseline/baseline_head/compute_task_delta, evaluate_diff_scope, evaluate_acceptance_criteria, path_under, other_open_tasks, classify_foreign_paths, changed_files_against_base, resolve_diff_base; .ai/scripts/orchestrator.py: ACTIONS/TEXT_ACTIONS/UNLOCKED_ACTIONS/IMPLEMENTING_EXITS/USAGE and main() argument dispatch, run_driver IMPLEMENTING branch, run_worktree, run_pr; .ai/hooks/pre_tool_use.py in full (protected patterns, path normalisation against worker/repo roots, approved_plan hash re-check, bash checks); .ai/hooks/session_start.py and .ai/hooks/stop_guard.py in full (exported-root resolution and cwd fallback); test_run_driver.py recovery fixtures and all Recover* / DocumentedLifecycleContract test classes; test_task_baseline.py ForeignTaskDeltaTests, test_worker_launch.py ExecutionRoot/RecordedWorktree/LegacyCheckout classes, test_hardening.py ProtectedCritiqueEvidenceTests and WorktreePreToolUseTests, test_plan_contract.py InitialPlanningFailureTests, test_fix_loop.py FailureReasonLifecycleTests, test_repo_hygiene.py workflow reader.
-  - `medium` F2's `foreign` classification cannot fire for worktrees the `worktree` verb actually records, and AC-7 proves it only at a path the orchestrator never produces — .ai/scripts/orchestrator.py:3810 (AC-7)
-    Structural ownership is established from two prefixes only: another open task's recorded `worktree` and its `.ai/tasks/<other-id>/` directory (other_open_tasks, orchestrator.py:3810-3817). Both prefix families are removed from every task manifest before classification ever runs: BASELINE_EXCLUDE_PREFIXES = ('.git/', '.worktrees/', '.ai/tasks/') at orchestrator.py:118, applied in baseline_excluded/enumerate_tree (3237-3282). run_worktree records exactly `.worktrees/<task-id>` (worktree_path, 5039-5040; state write 5094). Consequently, for any task whose worktree was created by the `worktree` verb, no path that could be classified `foreign` can appear in `delta['produced']`, so `summary['foreign']` in evaluate_diff_scope (3953-3955) is always empty and the classification is inert in the layout the orchestrator itself creates. AC-7 passes only because its fixture records task B's worktree at `sandboxes/TASK-998` — a location nothing in the orchestrator produces — and the fixture docstring states this explicitly (test_task_baseline.py:892-898). The `.ai/tasks/<other-id>/` half is likewise asserted by calling classify_foreign_paths directly (test_task_baseline.py:946-962) rather than through a delta. The net effect is that the only concurrency case the requirement cares about in practice (two open tasks touching shared source) is the documented residual, and the delivered mechanism does not change behaviour for real worktrees. Disclosed in implementation.md as a judgement call, but it means requirement 7 / AC-7 are satisfied by a fixture rather than by the production path.
-  - `low` A failed `git diff` is recorded as `committed_changed: []`, indistinguishable from "nothing committed changed" — .ai/scripts/orchestrator.py:3731 (AC-8)
-    changed_files_against_base returns [] on any non-zero git exit (orchestrator.py:3731-3732). evaluate_diff_scope calls it whenever the baseline recorded a head and stores the result verbatim as `summary['committed_changed']` (3932-3940). If the baseline head is unreachable in the execution root — a fresh worktree, a pruned/gc'd commit, a re-cloned tree — the evidence file reports an empty committed set and `committed_not_in_delta: []` with nothing recording that git could not answer. Requirement 8 explicitly chose omission over substitution for a missing `git.head`; the same conflation reappears here for an unanswerable one. Non-blocking evidence, but it is a claim of absence nothing verified.
-  - `low` Committed evidence uses three-dot diff, so a non-ancestor baseline head silently reverts to the fork point F3 was about — .ai/scripts/orchestrator.py:3723 (AC-8)
-    changed_files_against_base runs `git diff --name-only {base}...HEAD` (orchestrator.py:3723). Three dots diff from merge-base(base, HEAD), not from base. While the branch advances linearly from the captured baseline the two are identical, which is why AC-8 passes. After a rebase, amend or reset that makes the recorded baseline head no longer an ancestor of HEAD, the effective base becomes the merge base — i.e. the fork point — and `committed_changed` again lists branch history the task did not produce, which is the defect F3 exists to remove. `{base}..HEAD` would express the intended "since the baseline commit" exactly.
-  - `low` Recovery eligibility mixes attempt-scoped and whole-trail checks, so an interrupted `implement` after any earlier fix is not recoverable and `run` resumes it instead of stopping — .ai/scripts/orchestrator.py:3010 (AC-1, AC-6, AC-19)
-    last_implementation_attempt is attempt-scoped (orchestrator.py:2969-2990), but the CLAUDE_FIX_STARTED test uses has_event over the whole trail (3010). For the sequence FAILED -> CLAUDE_FIX -> fix -> validation fails -> CODEX_REPLAN -> approve -> implement -> killed, the current attempt is an uninterrupted-and-unterminated plain `implement`, yet `recover` refuses with "the task carries CLAUDE_FIX_STARTED, so `fix` is its legal verb". run_fix uses the same whole-trail check (2885), so the task is not stranded — but the interruption is never recorded as one, and run_driver's IMPLEMENTING branch takes the has_event(CLAUDE_FIX_STARTED) path (5542) and calls run_fix, i.e. `run` autonomously re-invokes the implementer on an interrupted implementation rather than stopping and naming `recover`. AC-19 does mandate the refusal and AC-6 only covers the no-CLAUDE_FIX_STARTED case, so this is inside the approved contract; flagging because the guarantee "an interrupted implementation reaches a routable state through `recover`, and `run` never resumes one on its own" holds only for tasks with no fix anywhere in their history.
-  - `low` `recover`'s unlocked write sequence is observable mid-update and its lock check is a TOCTOU — .ai/scripts/orchestrator.py:3116 (AC-2, AC-3)
-    run_recover takes no per-task lock (UNLOCKED_ACTIONS, orchestrator.py:5908) and gates only on `lock_path.exists()` at 3116, then writes IMPLEMENTATION_INTERRUPTED (3173), then state.json (3189), then TASK_RECOVERED (3191). Two consequences. (a) Another orchestrator invocation can create the lock in the window between 3116 and 3189 and then read the pre-recovery IMPLEMENTING state while recover overwrites it; save_state is atomic so no torn file results, but last-writer-wins across two views of the state is possible. (b) IMPLEMENTATION_INTERRUPTED is not in IMPLEMENTATION_TERMINATING_EVENTS (171-176), so a process killed between 3173 and 3189 leaves the attempt still "unterminated" and a re-run records a second IMPLEMENTATION_INTERRUPTED for the same attempt — the enumeration's own docstring claims a missing entry would let recovery accept an attempt whose outcome was already recorded. Both follow from decision 4's no-lock design and neither strands a task, so this is reported as an observation on the new write sequence rather than a defect in the approved behaviour.
-- **performance**: 2 finding(s). Examined: `.ai/scripts/orchestrator.py`: new/changed execution-root and evidence-path helpers (`repo_root`, `recorded_worktree`, `execution_root`, `authoritative_path`, `evidence_dir`, `worker_env`, `run_worker` cwd selection) for per-call state reloads and repeated filesystem work; `.ai/scripts/orchestrator.py`: baseline/delta path (`enumerate_tree`, `tree_manifest`, `digest_of_file`, `capture_baseline`, `compute_task_delta`) — confirmed `tree_manifest` is invoked once for capture and once per validation run (`run_validation:4046`), with the delta reused by both `evaluate_acceptance_criteria` and `evaluate_diff_scope` rather than recomputed; `.ai/scripts/orchestrator.py`: foreign-path classification (`other_open_tasks`, `path_under`, `classify_foreign_paths`) — `other_open_tasks` is loaded once per classification call, not per path; the remaining cost is O(changed paths x owning prefixes) with a small prefix set; `.ai/scripts/orchestrator.py`: committed-evidence change (`changed_files_against_base`, `resolve_diff_base`, `baseline_head`) — one `git diff` subprocess, and merge-base probing is no longer on the validation path; `.ai/scripts/orchestrator.py`: recovery path (`last_implementation_attempt`, `recovery_eligibility`, `lock_holder`, `run_recover`) and `run_driver`'s interrupted-IMPLEMENTING branch for repeated event-log scans and loop bounds (`RUN_MAX_STEPS`); `.ai/scripts/orchestrator.py`: critique persistence (`critique_file`, `normalise_critique_issues`, `persist_critique`, `critique_round`) and `run_plan`/`fail_planning` for per-round I/O; Timeout coverage of every `subprocess.run` call site in `.ai/scripts/orchestrator.py` (lines 603, 679, 1379, 1498, 3258, 3347, 3656, 3722, 3746, 4413, 5065, 5081, 5118, 5207, 5660, 5695, 5742) — each passes an explicit `timeout=`; `.ai/hooks/pre_tool_use.py`, `.ai/hooks/session_start.py`, `.ai/hooks/stop_guard.py`: per-invocation file reads (state.json, plan bytes, events.jsonl, context.jsonl, implementation.md) and the added regex patterns/`relative_to_repo` candidate-form loop; Test-suite wall-time changes in the diff: `test_task_baseline.py` template-repo caching (`_build_starting_repo`, `_template_repo`, `BaselineCase.setUp`, `tearDownModule`) and `test_repo_hygiene.py`'s batched `git check-ignore --stdin -z` (`ignored_among`), including whether the template cache key (`TaskDirCase.task_id`, a class attribute) actually amortises across test methods; New subprocess-launching test helpers for timeout arguments: `test_context_bus.py:692`, `test_context_bus.py:804`, `test_hardening.py:878`, `test_run_driver.py:1067`, `test_worker_launch.py:513/543`; Whether new tests spawn live worker CLIs or full validation runs: `test_run_driver.RecoverValidationRouteTests` stubs the validation profile and mocks `classify_failure_with_agent`; `test_worker_launch.ExecutionRootCase._launch` doubles `subprocess.run` and only the acceptance half runs a real short-lived interpreter.
-  - `low` New hook-launching subprocesses in the test suite carry no timeout — test_context_bus.py:692 (AC-16, AC-27, AC-31, AC-28)
-    The three subprocess launch helpers added by this change — `test_context_bus.WorktreeHookBehaviourTests._run` (line 692), `test_context_bus.WorktreeHookCopyAuthorityTests._launch` (line 804, which additionally goes through `bash .ai/hooks/run`) and `test_hardening.WorktreePreToolUseTests`' guard runner (line 878) — call `subprocess.run` without `timeout=`, while the other subprocess helpers added in the same change do set one (`test_run_driver.py:1074` uses `timeout=120`, `test_worker_launch.py:517/547` use `VERSION_TIMEOUT_S`). A child that wedges therefore blocks the whole run rather than failing its own test. That matters here specifically because AC-16 executes full discovery under a bounded acceptance timeout and has already been observed to hit it (routed failure recorded in the implementation notes, fix pass 4): a wedged hook consumes the entire budget and surfaces only as `returncode 124, timed out after 300s` with no indication of which test hung. The repository already treats this as a rule for production code — `test_orchestrator_infra.py:31-39` asserts `orchestrator.py` has at least as many `timeout=` arguments as `subprocess.run(` calls.
-  - `low` `run_recover` re-parses events.jsonl three times per invocation — .ai/scripts/orchestrator.py:3132 (AC-1, AC-3)
-    `recovery_eligibility` scans the whole event log twice — once via `has_event(task_id, "CLAUDE_FIX_STARTED")` (line 3010) and once via `last_implementation_attempt` (line 3017) — and then `run_recover` calls `last_implementation_attempt` a third time at line 3132 to recover the `started` event that `recovery_eligibility` had already computed and discarded (it returns only `(eligible, detail)`). Each call re-opens and re-JSON-parses every line of `events.jsonl`, which grows append-only for the life of a task. The cost is bounded and paid once per `recover` invocation, so this is a tidiness/scaling-with-trail-length issue rather than a hot path; returning the started event from `recovery_eligibility`, or scanning once for both facts, would remove two of the three passes.
-- **security**: 6 finding(s). Examined: .ai/tasks/TASK-008/requirement.md, plan-v4.json and implementation.md for the approved scope and declared files; .ai/hooks/pre_tool_use.py in full: PROTECTED_EVIDENCE_PATTERNS/PROTECTED_INFRA_PATTERNS, exported_dir/repo_root/worker_root/task_directory, normalise, relative_to_repo, approved_plan hash re-check, declared_files, check_write, check_bash, main dispatch; .ai/hooks/session_start.py: exported-root resolution, constitution and blackboard injection text; .ai/hooks/stop_guard.py: exported-root resolution and block/allow exit codes; .ai/hooks/run launcher and .claude/settings.json hook registration (cwd-relative commands), to establish which hook copy executes; .ai/scripts/orchestrator.py: repo_root/recorded_worktree/execution_root/authoritative_path/evidence_dir/worker_env, run_worker, claude_argv, codex_argv, implementer_argv, run_claude_implementation prompt, task_lock/lock_holder, recovery_eligibility/run_recover including the lock-override path, persist_critique/critique_file, run_plan failure handling and fail_planning, evaluate_acceptance_criteria (shell=True runner and its cwd), evaluate_diff_scope, classify_foreign_paths/other_open_tasks/path_under, capture_baseline/compute_task_delta roots, resolve_diff_base, CLI dispatch tables and USAGE; argv construction for every worker/git subprocess touched by the change (list form, no shell) and the one shell=True site (acceptance verify commands); environment-variable handling in the new tests (test_run_driver.py: mock.patch.dict and the explicitly-built CLI subprocess env); grep across the worktree for a fixed set of credential patterns (private-key headers, ghp_, sk-, api_key/token/password/Authorization literals) and for the developer's email domain.
-  - `medium` PreToolUse authorization inputs moved to unvalidated environment variables — .ai/hooks/pre_tool_use.py:111 (AC-28, AC-23)
-    The guard used to locate the approved plan and task evidence relative to its own cwd, i.e. inside the tree it was guarding. It now resolves them from ORCHESTRATOR_REPO_ROOT and ORCHESTRATOR_TASK_DIR. ORCHESTRATOR_TASK_DIR is taken verbatim (Path(raw), no exported_dir() is_dir check, no requirement that it sit under repo_root()/.ai/tasks/<ORCHESTRATOR_TASK_ID>), and approved_plan() then reads state.json, events.jsonl and the plan bytes from wherever it points. The sha256 re-check only proves internal consistency of that directory, so a self-consistent fake evidence dir (state.json naming a plan + a PLAN_APPROVED event with that plan's digest) authorizes writes to any .ai/scripts, .ai/schemas, .ai/hooks or .claude/settings.json path. A worker holds Bash and can create such a directory in its tree and launch a nested agent with these variables set. The implementation notes themselves record that these exports are decisive for authorization: inherited ORCHESTRATOR_* values made 14 existing hook tests authorize against the real TASK-008 plan instead of their fixture. A cheap cross-check (require the task dir to be repo_root/.ai/tasks/<task id>, or at least is_dir) would keep single-homing while removing the free choice of authority.
-  - `medium` Declared-path writes are allowed in the orchestrator checkout, where the task delta cannot see them — .ai/hooks/pre_tool_use.py:185 (AC-9, AC-28)
-    relative_to_repo() offers the candidate path relative to both worker_root() and repo_root(), and check_write allows an infrastructure path if any form is declared. So a worker rooted in .worktrees/<id> may write the checkout's copy of a declared file by absolute path — including .ai/scripts/orchestrator.py, the code the orchestrator executes on its next verb, and .ai/hooks/*. That the worker can reach the checkout is not hypothetical: run_claude_implementation now hands it absolute checkout paths and instructs it to write implementation.md there. Meanwhile capture_baseline (orchestrator.py:3378) and compute_task_delta (orchestrator.py:3490) enumerate only execution_root, so a write landing in the checkout appears in no baseline, no delta, no diff-scope violation list — it is outside the evidence the task is judged on, and outside this task's own reported 'exactly the 14 declared files' delta. The two-root leniency is deliberate and documented, but nothing in the guard or in validation distinguishes 'the declared file in the tree you were given' from 'the same-named file in the orchestrator's tree'.
-  - `medium` The enforcing hook copy is now branch content in the worker's own tree — .claude/settings.json:20 (AC-31, AC-28)
-    .claude/settings.json registers hooks as cwd-relative commands (`bash .ai/hooks/run .ai/hooks/pre_tool_use.py`), and worker execution is now rooted in the recorded worktree, so the guard that authorizes each write is the worktree's copy — whatever the task's branch happens to carry — while the authority it checks against is the checkout's plan. Nothing verifies that the executing copy matches the checkout's, so a worktree whose branch carries a weakened pre_tool_use.py or .ai/hooks/run enforces nothing, silently (the module's own docstring notes exit 1 denies nothing). The reachable case is not exotic: this task's approved plan declares .ai/hooks/pre_tool_use.py, so the implementer rewrote, in its own worktree, the very guard copy that governed its subsequent tool calls in that session. I am recording this because the security consequence of the approved 'which copy executes' decision (AC-31) is that guard code provenance moved from the developer's checkout to the task branch; the decision itself was made knowingly.
-  - `low` New path-resolution code in the guard can fail open on an unexpected exception — .ai/hooks/pre_tool_use.py:175 (AC-23, AC-28)
-    relative_to_repo() wraps Path(candidate)/resolve() in a try that catches only OSError. resolve() raises ValueError for an embedded null byte, and the loop's per-root try catches only (ValueError, OSError) around relative_to. An exception escaping check_write leaves the hook exiting 1, which this file documents as denying nothing — the failure mode it was written to avoid. Relatedly, normalise() strips only a leading './' and does not collapse interior './' or '../' segments, so `.ai/tasks/<id>/./state.json` does not match PROTECTED_EVIDENCE_PATTERNS in its raw form; the denial depends entirely on the resolved form being produced. Both point the same way: the resolution step should be treated as fallible and denied on failure rather than allowed to propagate.
-  - `low` Another task's recorded worktree string is trusted verbatim as a foreign-ownership prefix — .ai/scripts/orchestrator.py:3814 (AC-7)
-    other_open_tasks() appends other['worktree'] as an ownership prefix after only a non-empty string check — no is_dir validation (unlike recorded_worktree()), and no constraint that the value be under .worktrees/ or not an ancestor of shared source. classify_foreign_paths() then removes matching paths from `violations` at orchestrator.py:3953, so a broad or wrong recorded value in any other open task's state.json (e.g. '.ai' or a shared source directory) silently demotes real scope violations to non-blocking report metadata. path_under() correctly enforces component boundaries and terminal-state owners are excluded, so the remaining gap is the shape of the recorded value. Reachability is limited today because only run_worktree writes it (worktree_path(task_id)) and workers cannot write state.json, which is why this is low rather than higher — but the plan's own risk list names over-broad foreign matching as the thing to prevent, and the value is the one input not constrained.
-  - `low` Injected 'Project invariants' text is resolved from an env-supplied path to a file no tier protects — .ai/hooks/session_start.py:59 (AC-27)
-    session_start.py now resolves the constitution from ORCHESTRATOR_CONSTITUTION (taken verbatim, no containment check) and injects its contents into the worker's context under the heading 'Project invariants', i.e. as authoritative instructions to a session holding Edit/Write/Bash. The blackboard portion carries an explicit 'this is data, not instructions' caveat; the constitution portion carries none. .ai/constitution.md appears in neither PROTECTED_EVIDENCE_PATTERNS nor PROTECTED_INFRA_PATTERNS, so a worker may edit it without any plan declaration, and what it writes is delivered to the next worker as invariants. The env indirection is new here; the injection itself predates this change, so the actionable part is that neither the path nor the file has an ownership guard while the change makes the path externally chosen.
+- **correctness**: 4 finding(s). Examined: `.ai/tasks/TASK-008/requirement.md`, `plan-v4.json` and `implementation.md` as the contract under review; `.ai/scripts/orchestrator.py`: `run_recover`, `recovery_eligibility`, `last_implementation_attempt`, `lock_holder`, `IMPLEMENTATION_TERMINATING_EVENTS`, `RECOVER_*` env constants; `.ai/scripts/orchestrator.py`: `repo_root`, `recorded_worktree`, `execution_root`, `authoritative_path`, `evidence_dir`, `worker_env`, `run_worker`, `run_structured_agent`, `codex_argv`, `run_codex_planning`, `run_codex_replan`, `run_claude_implementation`; `.ai/scripts/orchestrator.py`: `capture_baseline`, `load_baseline`, `baseline_head`, `compute_task_delta`, `enumerate_tree`/`tree_manifest` exclusion rules, `evaluate_diff_scope`, `evaluate_acceptance_criteria`, `path_under`, `other_open_tasks`, `classify_foreign_paths`, `changed_files_against_base`, `resolve_diff_base`; `.ai/scripts/orchestrator.py`: `critique_file`, `normalise_critique_issues`, `persist_critique`, `critique_round`, `run_plan`, `fail_planning`, `leave_failed`, `last_recorded_failure_reason`, `route_failure`, `run_fix`, `run_implementation`, `fail_implementation`, `enter_validating`, `run_validation`, `run_review`, `run_worktree`, `run_pr`, `complete_task`, `run_driver`, dispatch tables, `USAGE` and `main()` argument handling; `.ai/hooks/pre_tool_use.py` in full (evidence/infra patterns, `relative_to_repo`, `approved_plan`, `check_write`, `check_bash`); `.ai/hooks/session_start.py` and `.ai/hooks/stop_guard.py` in full (exported-root resolution and cwd fallback); Tests: `test_run_driver.py` recovery classes (fixtures, eligibility, lock/dead-PID/override, schema validator and its counter-tests, CLI dispatch), `test_task_baseline.py` `ForeignTaskDeltaTests`, `test_worker_launch.py` execution-root classes, `test_context_bus.py` worktree hook-copy classes, `test_repo_hygiene.py` workflow parser and `CiMatrixTests`.
+  - `medium` Reviewers still run in the orchestrator checkout, so a task with a recorded worktree is reviewed against a tree that does not contain its change — .ai/scripts/orchestrator.py:698 (AC-9)
+    `run_worker` now roots worker subprocesses at `execution_root(task_id)` (orchestrator.py:617), and acceptance, delta and git corroboration follow the recorded worktree. `run_structured_agent` — which launches the three reviewers, the plan critic and the classifier — was left at `cwd=Path.cwd()` (orchestrator.py:698), and `review_prompt` computes its diff range with `resolve_diff_base()` with no root (orchestrator.py:4266) and names `task_dir(...)` relatively (orchestrator.py:4264). The implementer never commits, so for a task whose `state["worktree"]` is set, the change exists only in the worktree working tree; a reviewer launched with cwd = the checkout reads source files and computes `git diff base...HEAD` in a tree where the change is absent. `run_review` then writes `review-findings.json` and, with no blocking finding, advances the task to `PR_READY` (orchestrator.py:4420-4449). The failure mode is silent and is exactly the one the repository's rules forbid: an empty findings list produced by looking at the wrong code reads as 'reviewed and clean'. This is not exercised by any acceptance criterion — AC-9 asserts worker and acceptance cwd only — and it is inert for tasks whose `worktree` is null (including TASK-008 itself), which is why I rate it medium rather than high; it becomes live for the first task that uses the `worktree` verb this change was written to make real.
+  - `medium` `recovery_eligibility` tests `CLAUDE_FIX_STARTED` over the whole trail instead of the current attempt, so a genuinely interrupted `implement` after an earlier fix cycle cannot be recovered — .ai/scripts/orchestrator.py:3027 (AC-1, AC-19)
+    `recovery_eligibility` refuses whenever `has_event(task_id, "CLAUDE_FIX_STARTED")` is true anywhere in the trail (orchestrator.py:3027), while terminating events are correctly scoped to the attempt currently in flight by `last_implementation_attempt` (orchestrator.py:2986-3007). A reachable history breaks the asymmetry: implement → IMPLEMENTATION_FAILED → route-failure(CLAUDE_FIX) → fix → validation fails → route-failure(CODEX_REPLAN) → REPLANNING → new plan → approve → implement → killed. The task is now IMPLEMENTING with an unterminated `IMPLEMENTATION_STARTED` (mode=implement) and a stale `CLAUDE_FIX_STARTED` from the first cycle. `recover` refuses with 'the task carries CLAUDE_FIX_STARTED, so `fix` is its legal verb and there is no interruption for `recover` to close' — which is false for this history — and `run_driver` (orchestrator.py:5559) takes the fix branch for the same reason. `run_fix` will then re-invoke the implementer over the interrupted attempt and record a second `IMPLEMENTATION_STARTED`, so the interruption is never recorded as one and requirement AC-1's guarantee ('a task in IMPLEMENTING whose run was interrupted reaches a routable state through the recover verb') does not hold for this trail. The task is not stranded, and the behaviour matches plan-v4's literal requirement text ('no CLAUDE_FIX_STARTED'), so this is a scoping defect rather than an unsafe one; scoping the check to events after the last `IMPLEMENTATION_STARTED` would match how terminators are already handled.
+  - `low` Structural `foreign` classification cannot fire under the repository's own worktree and task-directory conventions — .ai/scripts/orchestrator.py:3839 (AC-7)
+    `classify_foreign_paths` attributes a changed path to another open task by its recorded worktree prefix or its `.ai/tasks/<id>/` directory (orchestrator.py:3839-3871, 3794-3836). Both prefix families are removed from the delta before classification ever sees them: `BASELINE_EXCLUDE_PREFIXES` drops `.worktrees/` and `.ai/tasks/` from every manifest (orchestrator.py:118, used by `enumerate_tree` at 3294), and `.ai/tasks/` is additionally in `DIFF_SCOPE_ALLOWLIST` so it is filtered out of `undeclared` (orchestrator.py:3964-3969). `run_worktree` always records `.worktrees/<task-id>` (orchestrator.py:5057, 5111). The consequence is that for any task created by this workflow, no path can ever be classified as `foreign`; the test that proves the behaviour has to record the second task's worktree at `sandboxes/TASK-998` and says so in its own docstring (test_task_baseline.py:892-898). The real-world isolation is delivered by F4 (task B's edits land in task B's worktree, which task A's manifest excludes anyway), and the residual shared-source case is documented and asserted (test_task_baseline.py:989), so nothing is wrong — but AC-7's scenario is only reachable through a non-conventional fixture, which means the criterion does not exercise a configuration this repository can produce.
+  - `low` The new no-argument text-verb branch in `main()` dispatches `reject` without taking the per-task lock — .ai/scripts/orchestrator.py:6045 (AC-24)
+    The branch added so `recover` with no reason reaches its own handler (orchestrator.py:6045-6047) matches any verb in `TEXT_ACTIONS`, and it calls the handler directly rather than through `task_lock`, unlike the four-argument branch above it which honours `UNLOCKED_ACTIONS` (orchestrator.py:6017-6021). `reject` is not in `UNLOCKED_ACTIONS`, so `orchestrator.py TASK-XXX reject` now runs `reject_plan(task_id, "")` unlocked. Today this is harmless because `reject_plan` refuses an empty reason before writing anything (orchestrator.py:4740-4747) — it only reads `state.json` — so no unlocked mutation occurs. It is a latent hazard rather than a live defect: the lock exemption is decided by argument count rather than by the `UNLOCKED_ACTIONS` set, so any future handler that does work before validating its text argument would mutate state outside the lock.
+- **performance**: 3 finding(s). Examined: .ai/scripts/orchestrator.py: execution_root/recorded_worktree/authoritative_path/evidence_dir/worker_env (per-call load_state and path resolution); run_worker cwd/env construction and the single worker_env build per launch; tree_manifest/enumerate_tree/digest_of_file — one `git ls-files` per manifest, chunked hashing, BASELINE_MAX_ENTRIES/BASELINE_MAX_BYTES bounds; run_validation: confirmed exactly one tree_manifest per run (compute_task_delta) with the delta passed into evaluate_acceptance_criteria and evaluate_diff_scope rather than recomputed; evaluate_diff_scope: baseline-HEAD-based changed_files_against_base (one git diff) and the DIFF_SCOPE_ALLOWLIST/declared set comparisons; classify_foreign_paths / other_open_tasks / path_under: owners resolved once outside the path loop; O(paths x owners) with owners bounded by open task directories; run_recover / recovery_eligibility / last_implementation_attempt / has_event: number of passes over events.jsonl per invocation; iter_events: streams events.jsonl line by line rather than reading it whole; persist_critique / critique_file / critique_round: one atomic write and one event per round; run_plan / fail_planning and leave_failed / last_recorded_failure_reason (single linear event scan); timeout arguments on every subprocess.run in .ai/scripts/orchestrator.py (worker, validation check, acceptance command, all git and gh invocations); .ai/hooks/pre_tool_use.py: relative_to_repo path-form construction, declared_files/approved_plan invocation pattern per hook process; .ai/hooks/session_start.py and stop_guard.py: evidence resolution and whole-file reads of context.jsonl/implementation.md per hook process; test_task_baseline.py: _build_starting_repo/_template_repo per-task-id template plus per-test copytree, and per-class setUp subprocess counts; test_repo_hygiene.py: ignored_among batching git check-ignore into one invocation via --stdin -z; test_worker_launch.py, test_context_bus.py, test_hardening.py, test_run_driver.py: per-test fixture construction and interpreter subprocess counts.
+  - `low` run_recover parses the event trail three times per invocation — .ai/scripts/orchestrator.py:3149 (AC-1, AC-2)
+    run_recover calls recovery_eligibility (which does a full has_event scan and then a full last_implementation_attempt scan of events.jsonl), and then calls last_implementation_attempt a second time at line 3149 to obtain the `started` event that recovery_eligibility already read and discarded. That is three sequential parses of the same append-only file for one CLI verb. The file is small and the verb is one-shot, so the cost is negligible today; it is a re-parse of data already in hand rather than a scaling problem. recovery_eligibility could return the started event alongside (eligible, detail) and remove the third pass.
+  - `low` CommittedEvidenceTests rebuilds branch history with four git subprocesses per test method — test_task_baseline.py:1029 (AC-8, AC-16)
+    setUp loops over two file names, running `git add -A` and `git commit` per iteration on top of the copied template repo — four git processes per test method, in the module whose per-method git construction was measured at ~0.4s for six processes on Windows and was deliberately hoisted into _build_starting_repo/_template_repo for exactly that reason. The commits are identical for every test in the class, so this is subprocess work in a loop that could be built once (a second template variant, or class-scoped setup) the same way the starting repo now is. It matters only because AC-16 runs full discovery inside a bounded acceptance timeout that has already failed once with returncode 124, and implementation.md records the post-fix spread on one host as 84s-151s against the 300s cap.
+  - `low` New test subprocess helpers invoke git and Python child processes with no timeout — test_repo_hygiene.py:340 (AC-16)
+    ignored_among runs `git check-ignore --stdin -z` with no timeout, and the same applies to _git_in in test_task_baseline.py (line 51) and the hook-launching helpers in test_context_bus.py (line 692) and test_hardening.py (line 56). Production code in .ai/scripts/orchestrator.py passes a timeout to every subprocess.run; these new/changed test helpers do not, so a child that hangs blocks the suite indefinitely for a developer running it directly, and consumes the whole AC-16/validation budget when run under the orchestrator. A per-call timeout would turn a hang into a named failure.
+- **security**: 3 finding(s). Examined: `.ai/hooks/pre_tool_use.py` in full (protected-evidence and infra pattern tiers, `exported_dir`/`repo_root`/`worker_root`/`task_directory`, `normalise`, `relative_to_repo`, `approved_plan` hash re-check, `check_write`, `check_bash`); `.ai/hooks/session_start.py` and `.ai/hooks/stop_guard.py` in full (ORCHESTRATOR_* root resolution, cwd fallback, blackboard/Stop evidence reads); `.ai/scripts/orchestrator.py` lines 225-465 (`task_lock`, `repo_root`, `recorded_worktree`, `execution_root`, `authoritative_path`, `evidence_dir`, `worker_env` exports); `.ai/scripts/orchestrator.py` lines 580-720 (`run_worker` argv/cwd/env construction, `run_structured_agent`); `.ai/scripts/orchestrator.py` lines 1490-1670 (`current_branch`, `verify_implementation_branch`, `codex_argv` incl. `--sandbox read-only` and `--output-last-message`, planning prompt); `.ai/scripts/orchestrator.py` lines 1990-2120 (`critique_file`/`persist_critique` artifact naming and payload) and 2170-2270 (`run_plan` failure handling, `fail_planning`); `.ai/scripts/orchestrator.py` lines 2310-2420 and 2830-2950 (implementer/fix prompt construction, `implementer_argv` wrapper, `run_fix` authorisation); `.ai/scripts/orchestrator.py` lines 3010-3235 (`recovery_eligibility`, `lock_holder`, `run_recover` lock handling, event/state writes); `.ai/scripts/orchestrator.py` lines 3250-3300 and 3620-3920 (`enumerate_tree`, acceptance execution via `shell=True`, `changed_files_against_base`, `resolve_diff_base`, `path_under`, `other_open_tasks`, `classify_foreign_paths`, `evaluate_diff_scope` roots); `.ai/scripts/orchestrator.py` lines 4000-4080 (`run_validation` execution root, delta and scope roots) and 5540-5610, 5900-6080 (run-driver interrupted branch, dispatch tables, `UNLOCKED_ACTIONS`, argv handling for the text verbs); Comparison of the changed `pre_tool_use.py` against the older copy at `C:\multi-agent-workflow\.ai\hooks\pre_tool_use.py` to separate new logic (`relative_to_repo` multi-root, critique pattern, exported roots) from unchanged logic (`check_bash`, `main`); Regex scan of all `*.py` in the TASK-008 worktree for `api_key|secret|token =|password|Bearer|ghp_|AKIA|PRIVATE KEY` (only benign test fixture strings matched); `CLAUDE.md` references to the ORCHESTRATOR_* environment contract and the lock-override variable.
+  - `medium` Declared infrastructure path is authorised under either root, so a worktree-rooted worker may write the orchestrator checkout's copy — where validation cannot see it — .ai/hooks/pre_tool_use.py:185 (AC-28, AC-9)
+    `relative_to_repo` now returns the candidate expressed relative to both `worker_root()` (the recorded worktree) and `repo_root()` (the orchestrator checkout), and `check_write` allows the write if *any* form appears in the approved plan's declared files. There is no containment check that the target actually lies under the worker's own root. So an implementer rooted in `.worktrees/TASK-008` that writes the absolute checkout path `<repo>/.ai/scripts/orchestrator.py` is allowed, because the repo-root form matches the declared path. Two consequences that did not exist before worktree rooting: (a) the checkout copy of `orchestrator.py`/`.ai/hooks/*` is the code the orchestrator itself executes to validate, review and route this very task, so a worker can alter its own judge mid-run; (b) validation is now rooted at the worktree only — `run_validation` computes `tree = execution_root(...)` and passes it to `compute_task_delta` and `evaluate_diff_scope` (orchestrator.py:4029, 4063, 4068) — so a write into the checkout appears in no delta, no scope violation and no `foreign` list. It also breaks the requirement's stated isolation invariant that the main checkout is frozen. A tighter rule (require the resolved path to be under `worker_root()` before accepting a declared-path match) would keep the legitimate case working.
+  - `low` Recovery's fail-closed lock gate is a TOCTOU check made without holding any lock — .ai/scripts/orchestrator.py:3133 (AC-3, AC-29)
+    `recover` is deliberately dispatched from `UNLOCKED_ACTIONS` (orchestrator.py:5925), and `run_recover` decides `locked = lock_path.exists()` at line 3133, then writes `state.json` at lines 3204-3206 and unlinks the lock at 3160. Nothing prevents another invocation from creating the lock via `task_lock`'s `O_CREAT|O_EXCL` between the check and the writes: in that window recovery proceeds without the override the gate exists to demand, and its `status=FAILED` write races the other invocation's read-modify-write of the same `state.json`. The window is narrow and the file write itself is atomic, but the developer-assertion gate for a concurrent orchestrator can be lost to timing rather than to an explicit override. Worth recording as an accepted residual risk if it is not closed, since the whole point of the gate is that liveness cannot be probed safely.
+  - `low` An unattributed recovery is still recorded as an attributable human assertion — .ai/scripts/orchestrator.py:3108 (AC-2)
+    `asserted_by` falls back to the literal string `"developer"` when `ORCHESTRATOR_RECOVERED_BY` is unset (lines 3108-3110), and that value is written into `IMPLEMENTATION_INTERRUPTED` alongside `assertion="human"` (lines 3198-3199), into `TASK_RECOVERED` (line 3214) and into the blackboard block (line 3221). The lock-override path correctly requires a non-empty name before it will proceed, but the recovery event itself records a placeholder identity as though someone had named themselves, so the audit trail cannot distinguish "Alice asserted this" from "nobody said who". Recording `"unknown"`, or requiring the variable as the override path does, would keep the event honest about what was actually observed. Note also that `CLAUDE.md` documents `ORCHESTRATOR_RECOVER_LOCK_OVERRIDE` (line 139) but never mentions `ORCHESTRATOR_RECOVERED_BY`, so a developer has no documented way to supply the identity the event claims.
 
 ## Evidence
 
