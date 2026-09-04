@@ -1,0 +1,177 @@
+{
+  "task_id": "TASK-008",
+  "timestamp": "2026-09-04T12:14:46.770242+05:30",
+  "dimensions": {
+    "correctness": {
+      "ran": true,
+      "findings": [
+        {
+          "severity": "medium",
+          "title": "Reviewers still run in the orchestrator checkout, so a task with a recorded worktree is reviewed against a tree that does not contain its change",
+          "detail": "`run_worker` now roots worker subprocesses at `execution_root(task_id)` (orchestrator.py:617), and acceptance, delta and git corroboration follow the recorded worktree. `run_structured_agent` \u2014 which launches the three reviewers, the plan critic and the classifier \u2014 was left at `cwd=Path.cwd()` (orchestrator.py:698), and `review_prompt` computes its diff range with `resolve_diff_base()` with no root (orchestrator.py:4266) and names `task_dir(...)` relatively (orchestrator.py:4264). The implementer never commits, so for a task whose `state[\"worktree\"]` is set, the change exists only in the worktree working tree; a reviewer launched with cwd = the checkout reads source files and computes `git diff base...HEAD` in a tree where the change is absent. `run_review` then writes `review-findings.json` and, with no blocking finding, advances the task to `PR_READY` (orchestrator.py:4420-4449). The failure mode is silent and is exactly the one the repository's rules forbid: an empty findings list produced by looking at the wrong code reads as 'reviewed and clean'. This is not exercised by any acceptance criterion \u2014 AC-9 asserts worker and acceptance cwd only \u2014 and it is inert for tasks whose `worktree` is null (including TASK-008 itself), which is why I rate it medium rather than high; it becomes live for the first task that uses the `worktree` verb this change was written to make real.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 698,
+          "acceptance_criteria": [
+            "AC-9"
+          ]
+        },
+        {
+          "severity": "medium",
+          "title": "`recovery_eligibility` tests `CLAUDE_FIX_STARTED` over the whole trail instead of the current attempt, so a genuinely interrupted `implement` after an earlier fix cycle cannot be recovered",
+          "detail": "`recovery_eligibility` refuses whenever `has_event(task_id, \"CLAUDE_FIX_STARTED\")` is true anywhere in the trail (orchestrator.py:3027), while terminating events are correctly scoped to the attempt currently in flight by `last_implementation_attempt` (orchestrator.py:2986-3007). A reachable history breaks the asymmetry: implement \u2192 IMPLEMENTATION_FAILED \u2192 route-failure(CLAUDE_FIX) \u2192 fix \u2192 validation fails \u2192 route-failure(CODEX_REPLAN) \u2192 REPLANNING \u2192 new plan \u2192 approve \u2192 implement \u2192 killed. The task is now IMPLEMENTING with an unterminated `IMPLEMENTATION_STARTED` (mode=implement) and a stale `CLAUDE_FIX_STARTED` from the first cycle. `recover` refuses with 'the task carries CLAUDE_FIX_STARTED, so `fix` is its legal verb and there is no interruption for `recover` to close' \u2014 which is false for this history \u2014 and `run_driver` (orchestrator.py:5559) takes the fix branch for the same reason. `run_fix` will then re-invoke the implementer over the interrupted attempt and record a second `IMPLEMENTATION_STARTED`, so the interruption is never recorded as one and requirement AC-1's guarantee ('a task in IMPLEMENTING whose run was interrupted reaches a routable state through the recover verb') does not hold for this trail. The task is not stranded, and the behaviour matches plan-v4's literal requirement text ('no CLAUDE_FIX_STARTED'), so this is a scoping defect rather than an unsafe one; scoping the check to events after the last `IMPLEMENTATION_STARTED` would match how terminators are already handled.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3027,
+          "acceptance_criteria": [
+            "AC-1",
+            "AC-19"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "Structural `foreign` classification cannot fire under the repository's own worktree and task-directory conventions",
+          "detail": "`classify_foreign_paths` attributes a changed path to another open task by its recorded worktree prefix or its `.ai/tasks/<id>/` directory (orchestrator.py:3839-3871, 3794-3836). Both prefix families are removed from the delta before classification ever sees them: `BASELINE_EXCLUDE_PREFIXES` drops `.worktrees/` and `.ai/tasks/` from every manifest (orchestrator.py:118, used by `enumerate_tree` at 3294), and `.ai/tasks/` is additionally in `DIFF_SCOPE_ALLOWLIST` so it is filtered out of `undeclared` (orchestrator.py:3964-3969). `run_worktree` always records `.worktrees/<task-id>` (orchestrator.py:5057, 5111). The consequence is that for any task created by this workflow, no path can ever be classified as `foreign`; the test that proves the behaviour has to record the second task's worktree at `sandboxes/TASK-998` and says so in its own docstring (test_task_baseline.py:892-898). The real-world isolation is delivered by F4 (task B's edits land in task B's worktree, which task A's manifest excludes anyway), and the residual shared-source case is documented and asserted (test_task_baseline.py:989), so nothing is wrong \u2014 but AC-7's scenario is only reachable through a non-conventional fixture, which means the criterion does not exercise a configuration this repository can produce.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3839,
+          "acceptance_criteria": [
+            "AC-7"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "The new no-argument text-verb branch in `main()` dispatches `reject` without taking the per-task lock",
+          "detail": "The branch added so `recover` with no reason reaches its own handler (orchestrator.py:6045-6047) matches any verb in `TEXT_ACTIONS`, and it calls the handler directly rather than through `task_lock`, unlike the four-argument branch above it which honours `UNLOCKED_ACTIONS` (orchestrator.py:6017-6021). `reject` is not in `UNLOCKED_ACTIONS`, so `orchestrator.py TASK-XXX reject` now runs `reject_plan(task_id, \"\")` unlocked. Today this is harmless because `reject_plan` refuses an empty reason before writing anything (orchestrator.py:4740-4747) \u2014 it only reads `state.json` \u2014 so no unlocked mutation occurs. It is a latent hazard rather than a live defect: the lock exemption is decided by argument count rather than by the `UNLOCKED_ACTIONS` set, so any future handler that does work before validating its text argument would mutate state outside the lock.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 6045,
+          "acceptance_criteria": [
+            "AC-24"
+          ]
+        }
+      ],
+      "checked": [
+        "`.ai/tasks/TASK-008/requirement.md`, `plan-v4.json` and `implementation.md` as the contract under review",
+        "`.ai/scripts/orchestrator.py`: `run_recover`, `recovery_eligibility`, `last_implementation_attempt`, `lock_holder`, `IMPLEMENTATION_TERMINATING_EVENTS`, `RECOVER_*` env constants",
+        "`.ai/scripts/orchestrator.py`: `repo_root`, `recorded_worktree`, `execution_root`, `authoritative_path`, `evidence_dir`, `worker_env`, `run_worker`, `run_structured_agent`, `codex_argv`, `run_codex_planning`, `run_codex_replan`, `run_claude_implementation`",
+        "`.ai/scripts/orchestrator.py`: `capture_baseline`, `load_baseline`, `baseline_head`, `compute_task_delta`, `enumerate_tree`/`tree_manifest` exclusion rules, `evaluate_diff_scope`, `evaluate_acceptance_criteria`, `path_under`, `other_open_tasks`, `classify_foreign_paths`, `changed_files_against_base`, `resolve_diff_base`",
+        "`.ai/scripts/orchestrator.py`: `critique_file`, `normalise_critique_issues`, `persist_critique`, `critique_round`, `run_plan`, `fail_planning`, `leave_failed`, `last_recorded_failure_reason`, `route_failure`, `run_fix`, `run_implementation`, `fail_implementation`, `enter_validating`, `run_validation`, `run_review`, `run_worktree`, `run_pr`, `complete_task`, `run_driver`, dispatch tables, `USAGE` and `main()` argument handling",
+        "`.ai/hooks/pre_tool_use.py` in full (evidence/infra patterns, `relative_to_repo`, `approved_plan`, `check_write`, `check_bash`)",
+        "`.ai/hooks/session_start.py` and `.ai/hooks/stop_guard.py` in full (exported-root resolution and cwd fallback)",
+        "Tests: `test_run_driver.py` recovery classes (fixtures, eligibility, lock/dead-PID/override, schema validator and its counter-tests, CLI dispatch), `test_task_baseline.py` `ForeignTaskDeltaTests`, `test_worker_launch.py` execution-root classes, `test_context_bus.py` worktree hook-copy classes, `test_repo_hygiene.py` workflow parser and `CiMatrixTests`"
+      ]
+    },
+    "security": {
+      "ran": true,
+      "findings": [
+        {
+          "severity": "medium",
+          "title": "Declared infrastructure path is authorised under either root, so a worktree-rooted worker may write the orchestrator checkout's copy \u2014 where validation cannot see it",
+          "detail": "`relative_to_repo` now returns the candidate expressed relative to both `worker_root()` (the recorded worktree) and `repo_root()` (the orchestrator checkout), and `check_write` allows the write if *any* form appears in the approved plan's declared files. There is no containment check that the target actually lies under the worker's own root. So an implementer rooted in `.worktrees/TASK-008` that writes the absolute checkout path `<repo>/.ai/scripts/orchestrator.py` is allowed, because the repo-root form matches the declared path. Two consequences that did not exist before worktree rooting: (a) the checkout copy of `orchestrator.py`/`.ai/hooks/*` is the code the orchestrator itself executes to validate, review and route this very task, so a worker can alter its own judge mid-run; (b) validation is now rooted at the worktree only \u2014 `run_validation` computes `tree = execution_root(...)` and passes it to `compute_task_delta` and `evaluate_diff_scope` (orchestrator.py:4029, 4063, 4068) \u2014 so a write into the checkout appears in no delta, no scope violation and no `foreign` list. It also breaks the requirement's stated isolation invariant that the main checkout is frozen. A tighter rule (require the resolved path to be under `worker_root()` before accepting a declared-path match) would keep the legitimate case working.",
+          "file": ".ai/hooks/pre_tool_use.py",
+          "line": 185,
+          "acceptance_criteria": [
+            "AC-28",
+            "AC-9"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "Recovery's fail-closed lock gate is a TOCTOU check made without holding any lock",
+          "detail": "`recover` is deliberately dispatched from `UNLOCKED_ACTIONS` (orchestrator.py:5925), and `run_recover` decides `locked = lock_path.exists()` at line 3133, then writes `state.json` at lines 3204-3206 and unlinks the lock at 3160. Nothing prevents another invocation from creating the lock via `task_lock`'s `O_CREAT|O_EXCL` between the check and the writes: in that window recovery proceeds without the override the gate exists to demand, and its `status=FAILED` write races the other invocation's read-modify-write of the same `state.json`. The window is narrow and the file write itself is atomic, but the developer-assertion gate for a concurrent orchestrator can be lost to timing rather than to an explicit override. Worth recording as an accepted residual risk if it is not closed, since the whole point of the gate is that liveness cannot be probed safely.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3133,
+          "acceptance_criteria": [
+            "AC-3",
+            "AC-29"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "An unattributed recovery is still recorded as an attributable human assertion",
+          "detail": "`asserted_by` falls back to the literal string `\"developer\"` when `ORCHESTRATOR_RECOVERED_BY` is unset (lines 3108-3110), and that value is written into `IMPLEMENTATION_INTERRUPTED` alongside `assertion=\"human\"` (lines 3198-3199), into `TASK_RECOVERED` (line 3214) and into the blackboard block (line 3221). The lock-override path correctly requires a non-empty name before it will proceed, but the recovery event itself records a placeholder identity as though someone had named themselves, so the audit trail cannot distinguish \"Alice asserted this\" from \"nobody said who\". Recording `\"unknown\"`, or requiring the variable as the override path does, would keep the event honest about what was actually observed. Note also that `CLAUDE.md` documents `ORCHESTRATOR_RECOVER_LOCK_OVERRIDE` (line 139) but never mentions `ORCHESTRATOR_RECOVERED_BY`, so a developer has no documented way to supply the identity the event claims.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3108,
+          "acceptance_criteria": [
+            "AC-2"
+          ]
+        }
+      ],
+      "checked": [
+        "`.ai/hooks/pre_tool_use.py` in full (protected-evidence and infra pattern tiers, `exported_dir`/`repo_root`/`worker_root`/`task_directory`, `normalise`, `relative_to_repo`, `approved_plan` hash re-check, `check_write`, `check_bash`)",
+        "`.ai/hooks/session_start.py` and `.ai/hooks/stop_guard.py` in full (ORCHESTRATOR_* root resolution, cwd fallback, blackboard/Stop evidence reads)",
+        "`.ai/scripts/orchestrator.py` lines 225-465 (`task_lock`, `repo_root`, `recorded_worktree`, `execution_root`, `authoritative_path`, `evidence_dir`, `worker_env` exports)",
+        "`.ai/scripts/orchestrator.py` lines 580-720 (`run_worker` argv/cwd/env construction, `run_structured_agent`)",
+        "`.ai/scripts/orchestrator.py` lines 1490-1670 (`current_branch`, `verify_implementation_branch`, `codex_argv` incl. `--sandbox read-only` and `--output-last-message`, planning prompt)",
+        "`.ai/scripts/orchestrator.py` lines 1990-2120 (`critique_file`/`persist_critique` artifact naming and payload) and 2170-2270 (`run_plan` failure handling, `fail_planning`)",
+        "`.ai/scripts/orchestrator.py` lines 2310-2420 and 2830-2950 (implementer/fix prompt construction, `implementer_argv` wrapper, `run_fix` authorisation)",
+        "`.ai/scripts/orchestrator.py` lines 3010-3235 (`recovery_eligibility`, `lock_holder`, `run_recover` lock handling, event/state writes)",
+        "`.ai/scripts/orchestrator.py` lines 3250-3300 and 3620-3920 (`enumerate_tree`, acceptance execution via `shell=True`, `changed_files_against_base`, `resolve_diff_base`, `path_under`, `other_open_tasks`, `classify_foreign_paths`, `evaluate_diff_scope` roots)",
+        "`.ai/scripts/orchestrator.py` lines 4000-4080 (`run_validation` execution root, delta and scope roots) and 5540-5610, 5900-6080 (run-driver interrupted branch, dispatch tables, `UNLOCKED_ACTIONS`, argv handling for the text verbs)",
+        "Comparison of the changed `pre_tool_use.py` against the older copy at `C:\\multi-agent-workflow\\.ai\\hooks\\pre_tool_use.py` to separate new logic (`relative_to_repo` multi-root, critique pattern, exported roots) from unchanged logic (`check_bash`, `main`)",
+        "Regex scan of all `*.py` in the TASK-008 worktree for `api_key|secret|token =|password|Bearer|ghp_|AKIA|PRIVATE KEY` (only benign test fixture strings matched)",
+        "`CLAUDE.md` references to the ORCHESTRATOR_* environment contract and the lock-override variable"
+      ]
+    },
+    "performance": {
+      "ran": true,
+      "findings": [
+        {
+          "severity": "low",
+          "title": "run_recover parses the event trail three times per invocation",
+          "detail": "run_recover calls recovery_eligibility (which does a full has_event scan and then a full last_implementation_attempt scan of events.jsonl), and then calls last_implementation_attempt a second time at line 3149 to obtain the `started` event that recovery_eligibility already read and discarded. That is three sequential parses of the same append-only file for one CLI verb. The file is small and the verb is one-shot, so the cost is negligible today; it is a re-parse of data already in hand rather than a scaling problem. recovery_eligibility could return the started event alongside (eligible, detail) and remove the third pass.",
+          "file": ".ai/scripts/orchestrator.py",
+          "line": 3149,
+          "acceptance_criteria": [
+            "AC-1",
+            "AC-2"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "CommittedEvidenceTests rebuilds branch history with four git subprocesses per test method",
+          "detail": "setUp loops over two file names, running `git add -A` and `git commit` per iteration on top of the copied template repo \u2014 four git processes per test method, in the module whose per-method git construction was measured at ~0.4s for six processes on Windows and was deliberately hoisted into _build_starting_repo/_template_repo for exactly that reason. The commits are identical for every test in the class, so this is subprocess work in a loop that could be built once (a second template variant, or class-scoped setup) the same way the starting repo now is. It matters only because AC-16 runs full discovery inside a bounded acceptance timeout that has already failed once with returncode 124, and implementation.md records the post-fix spread on one host as 84s-151s against the 300s cap.",
+          "file": "test_task_baseline.py",
+          "line": 1029,
+          "acceptance_criteria": [
+            "AC-8",
+            "AC-16"
+          ]
+        },
+        {
+          "severity": "low",
+          "title": "New test subprocess helpers invoke git and Python child processes with no timeout",
+          "detail": "ignored_among runs `git check-ignore --stdin -z` with no timeout, and the same applies to _git_in in test_task_baseline.py (line 51) and the hook-launching helpers in test_context_bus.py (line 692) and test_hardening.py (line 56). Production code in .ai/scripts/orchestrator.py passes a timeout to every subprocess.run; these new/changed test helpers do not, so a child that hangs blocks the suite indefinitely for a developer running it directly, and consumes the whole AC-16/validation budget when run under the orchestrator. A per-call timeout would turn a hang into a named failure.",
+          "file": "test_repo_hygiene.py",
+          "line": 340,
+          "acceptance_criteria": [
+            "AC-16"
+          ]
+        }
+      ],
+      "checked": [
+        ".ai/scripts/orchestrator.py: execution_root/recorded_worktree/authoritative_path/evidence_dir/worker_env (per-call load_state and path resolution)",
+        "run_worker cwd/env construction and the single worker_env build per launch",
+        "tree_manifest/enumerate_tree/digest_of_file \u2014 one `git ls-files` per manifest, chunked hashing, BASELINE_MAX_ENTRIES/BASELINE_MAX_BYTES bounds",
+        "run_validation: confirmed exactly one tree_manifest per run (compute_task_delta) with the delta passed into evaluate_acceptance_criteria and evaluate_diff_scope rather than recomputed",
+        "evaluate_diff_scope: baseline-HEAD-based changed_files_against_base (one git diff) and the DIFF_SCOPE_ALLOWLIST/declared set comparisons",
+        "classify_foreign_paths / other_open_tasks / path_under: owners resolved once outside the path loop; O(paths x owners) with owners bounded by open task directories",
+        "run_recover / recovery_eligibility / last_implementation_attempt / has_event: number of passes over events.jsonl per invocation",
+        "iter_events: streams events.jsonl line by line rather than reading it whole",
+        "persist_critique / critique_file / critique_round: one atomic write and one event per round",
+        "run_plan / fail_planning and leave_failed / last_recorded_failure_reason (single linear event scan)",
+        "timeout arguments on every subprocess.run in .ai/scripts/orchestrator.py (worker, validation check, acceptance command, all git and gh invocations)",
+        ".ai/hooks/pre_tool_use.py: relative_to_repo path-form construction, declared_files/approved_plan invocation pattern per hook process",
+        ".ai/hooks/session_start.py and stop_guard.py: evidence resolution and whole-file reads of context.jsonl/implementation.md per hook process",
+        "test_task_baseline.py: _build_starting_repo/_template_repo per-task-id template plus per-test copytree, and per-class setUp subprocess counts",
+        "test_repo_hygiene.py: ignored_among batching git check-ignore into one invocation via --stdin -z",
+        "test_worker_launch.py, test_context_bus.py, test_hardening.py, test_run_driver.py: per-test fixture construction and interpreter subprocess counts"
+      ]
+    }
+  },
+  "summary": {
+    "dimensions_ran": [
+      "correctness",
+      "performance",
+      "security"
+    ],
+    "dimensions_failed": {}
+  }
+}

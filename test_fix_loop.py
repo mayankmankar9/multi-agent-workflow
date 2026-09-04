@@ -10,7 +10,13 @@ import json
 import unittest
 from unittest import mock
 
-from _support import TaskDirCase, load_orchestrator, plan_json, quiet
+from _support import (
+    TaskDirCase,
+    load_orchestrator,
+    plan_json,
+    quiet,
+    worker_name,
+)
 
 orch = load_orchestrator()
 
@@ -197,6 +203,160 @@ class RouteFailureHandoffTests(TaskDirCase):
 
         self.assertEqual(self.read_state()["status"], "IMPLEMENTING")
         self.assertTrue(orch.has_event(self.task_id, "CLAUDE_FIX_STARTED"))
+
+
+class FailureReasonLifecycleTests(TaskDirCase):
+    """A resolved failure must not follow the task around.
+
+    TASK-007's state.json carried ``fix-precondition: plan_rejected`` from a
+    superseded routing decision while its status was IMPLEMENTING and its
+    approval gate had passed: every later prompt and report read a live failure
+    that no longer existed. The reason belongs in the append-only trail, which
+    is why clearing it from the live state loses nothing.
+    """
+
+    REASON = "Validation command failed with exit code 1"
+
+    def _reset(self):
+        """Clear the task's evidence so the next route starts from FAILED."""
+        for child in sorted(self.task_path.iterdir()):
+            if child.is_file():
+                child.unlink()
+
+    def _failed(self, **overrides):
+        self.write_requirement()
+        self.write_plan("plan.json", PLAN)
+        self.write_state(status="AWAITING_APPROVAL")
+
+        with quiet():
+            orch.approve_plan(self.task_id)
+
+        self.write_state(
+            status="FAILED", failure_reason=self.REASON, **overrides
+        )
+
+    def _route(self, route):
+        """Route a FAILED task, with both workers doubled."""
+
+        def fake_run(argv, **kwargs):
+            if worker_name(argv) == "claude":
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"verdict": "pass", "issues": []}),
+                    stderr="",
+                )
+
+            out = argv[argv.index("--output-last-message") + 1]
+            orch.Path(out).write_text(plan_json(), encoding="utf-8")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(
+            orch,
+            "classify_failure_with_agent",
+            return_value=(route, {"source": "test"}),
+        ), mock.patch.object(orch.subprocess, "run", side_effect=fake_run):
+            with quiet() as out:
+                code = orch.route_failure(self.task_id)
+
+        return code, out.getvalue()
+
+    def test_failure_reason_is_cleared_on_every_exit_from_failed(self):
+        """Each route that leaves FAILED, and the one that does not.
+
+        Enumerated against ``FAILURE_ROUTES`` rather than against a list this
+        test happens to know, so a route added later cannot slip past with no
+        assertion about the reason it leaves behind.
+        """
+        self.assertEqual(
+            set(orch.FAILURE_ROUTES),
+            {"CLAUDE_FIX", "CODEX_REPLAN", "DEVELOPER_CLARIFICATION"},
+            "a new failure route needs its own failure_reason assertion here",
+        )
+
+        exits = {"CLAUDE_FIX": "IMPLEMENTING", "CODEX_REPLAN": "AWAITING_APPROVAL"}
+
+        for route, expected in exits.items():
+            with self.subTest(route=route):
+                self._reset()
+                self._failed()
+
+                code, _ = self._route(route)
+                state = self.read_state()
+
+                self.assertEqual(code, 0)
+                self.assertEqual(state["status"], expected)
+                self.assertNotEqual(state["status"], "FAILED")
+                self.assertIsNone(
+                    state["failure_reason"],
+                    "%s left the failure reason on a task that is no longer "
+                    "failed" % route,
+                )
+                # Nothing was lost: the reason is in the append-only trail, and
+                # the prompt builders read it from there.
+                routed = [
+                    e for e in self.events() if e["event"] == "FAILURE_ROUTED"
+                ]
+                self.assertEqual(routed[-1]["failure_reason"], self.REASON)
+                self.assertEqual(
+                    orch.last_recorded_failure_reason(self.task_id),
+                    self.REASON,
+                )
+
+        # DEVELOPER_CLARIFICATION is not an exit: the task stays FAILED, so its
+        # reason is still live and must survive.
+        self._reset()
+        self._failed()
+        self._route("DEVELOPER_CLARIFICATION")
+
+        held = self.read_state()
+        self.assertEqual(held["status"], "FAILED")
+        self.assertEqual(held["failure_reason"], self.REASON)
+
+    def test_the_fix_prompt_still_has_the_reason_after_clearing(self):
+        """Clearing must not cost the fix worker its evidence.
+
+        ``run_fix`` builds its prompt after routing has already cleared the
+        live field, so the evidence has to come out of the trail.
+        """
+        self._failed()
+        self.write_baseline()
+        self._route("CLAUDE_FIX")
+
+        self.assertIsNone(self.read_state()["failure_reason"])
+
+        _, state = orch.load_state(self.task_id)
+
+        self.assertIn(self.REASON, orch.failure_evidence(self.task_id, state))
+
+    def test_a_replan_records_the_reason_before_clearing_it(self):
+        """The replan prompt is built from the pre-clear snapshot."""
+        self._failed()
+
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            if worker_name(argv) == "claude":
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"verdict": "pass", "issues": []}),
+                    stderr="",
+                )
+
+            captured["prompt"] = kwargs.get("input")
+            out = argv[argv.index("--output-last-message") + 1]
+            orch.Path(out).write_text(plan_json(), encoding="utf-8")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(
+            orch,
+            "classify_failure_with_agent",
+            return_value=("CODEX_REPLAN", {"source": "test"}),
+        ), mock.patch.object(orch.subprocess, "run", side_effect=fake_run):
+            with quiet():
+                orch.route_failure(self.task_id)
+
+        self.assertIsNone(self.read_state()["failure_reason"])
+        self.assertIn(self.REASON, captured["prompt"])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,14 @@ Two things are required of an implementation worker:
 
 **Exit code 2 is the only code that blocks.** Exit 1 blocks nothing -- it is the
 single most common hooks bug, so this script never uses it for a refusal.
+
+Registered as a cwd-relative command, so the copy that runs belongs to the
+worker's cwd -- its recorded worktree, once worker execution is rooted there.
+The evidence it checks is not in that copy's tree: ``implementation.md`` and
+the blackboard live in the orchestrator checkout, and a guard resolving them
+against the worker's cwd would check an empty directory and pass everything.
+The authoritative location arrives as an absolute path from ``worker_env()``,
+with cwd kept as the fallback outside an orchestrated run.
 """
 
 import json
@@ -23,6 +31,25 @@ CONTEXT_FILENAME = "context.jsonl"
 
 BLOCK = 2  # the only exit code the harness treats as a refusal
 ALLOW = 0
+
+
+def repo_root():
+    """The orchestrator checkout, where task evidence is single-homed."""
+    raw = (os.environ.get("ORCHESTRATOR_REPO_ROOT") or "").strip()
+
+    if raw and Path(raw).is_dir():
+        return Path(raw)
+
+    return Path.cwd()
+
+
+def task_directory(task_id):
+    raw = (os.environ.get("ORCHESTRATOR_TASK_DIR") or "").strip()
+
+    if raw:
+        return Path(raw)
+
+    return repo_root() / ".ai" / "tasks" / task_id
 
 
 class Unreadable(Exception):
@@ -54,7 +81,7 @@ def read_guarded(path):
 
 
 def context_blocks(task_id):
-    path = Path(".ai") / "tasks" / task_id / CONTEXT_FILENAME
+    path = task_directory(task_id) / CONTEXT_FILENAME
 
     if not path.is_file():
         return []
@@ -83,7 +110,7 @@ def main():
     if os.environ.get("ORCHESTRATOR_SKIP_STOP_GUARD") == "1":
         return ALLOW
 
-    task_dir = Path(".ai") / "tasks" / task_id
+    task_dir = task_directory(task_id)
     problems = []
 
     notes = task_dir / "implementation.md"

@@ -1,0 +1,48 @@
+{
+  "task_id": "TASK-009",
+  "plan_file": ".ai\\tasks\\TASK-009\\plan.json",
+  "plan_stem": "plan",
+  "plan_version": 1,
+  "round": 1,
+  "max_rounds": 2,
+  "written_at": "2026-09-04T17:34:20.479588+05:30",
+  "ran": true,
+  "verdict": "pass",
+  "acceptable": true,
+  "rounds_exhausted": false,
+  "issue_count": 6,
+  "blocking_count": 0,
+  "issues": [
+    {
+      "severity": "medium",
+      "issue": "Requirement 'what must be true' #2 includes 'labels the constitution with `CONSTITUTION_RELATIVE`', and no acceptance criterion settles it. AC-3 only distinguishes an absent constitution (silent) from an undecodable one (warns on stderr); neither outcome inspects the injected heading. A reconciliation that resolves the constitution through `constitution_path()` but labels the section with the absolute exported path (or with `str(constitution)`) passes every criterion in this plan.",
+      "suggestion": "Extend AC-3 (or add AC-3b) with a case that exports `ORCHESTRATOR_CONSTITUTION` to a readable fixture outside the repo and asserts stdout carries the relative `.ai/constitution.md` label, not the exported absolute path; add the test name to the verify command."
+    },
+    {
+      "severity": "medium",
+      "issue": "AC-4's verify (`{python} -m unittest -v test_hook_resilience`) does not settle the first half of its own statement, that 'the hook test harness overrides all authoritative rooting variables'. Whether the module passes with an unrepaired `run_hook` depends on whether ORCHESTRATOR_TASK_DIR/REPO_ROOT/CONSTITUTION happen to be exported into the validation process. Run without them, the module passes with the inheritance bug (plan requirement #6, and a pre-planning finding) fully intact.",
+      "suggestion": "Make the harness repair verifiable on its own: add a test that patches hostile ambient values into `os.environ` (e.g. ORCHESTRATOR_TASK_DIR pointing at a decoy directory containing valid notes) and asserts an existing fixture-based case still resolves to the tmpdir, then name that test in AC-4's verify or split it into a separate criterion."
+    },
+    {
+      "severity": "low",
+      "issue": "AC-5 claims 'no conflict syntax' but `py_compile` only rejects markers that are syntax errors. A `<<<<<<< HEAD` / `=======` / `>>>>>>> main` line left inside a docstring, comment or string literal compiles cleanly, so the criterion is weaker than the statement (and than requirement #3).",
+      "suggestion": "Append a marker scan to AC-5's verify, e.g. a `{python} -c` snippet that reads both hooks and exits non-zero if any line starts with `<<<<<<<`, `=======` or `>>>>>>>`, so the command settles both halves of the statement."
+    },
+    {
+      "severity": "low",
+      "issue": "AC-1 as stated ('exit 2 and a diagnostic') could pass with the TASK-008 half reverted: with cwd-based resolution the fixture task directory is not found, `implementation.md` is missing, and stop_guard still returns BLOCK/exit 2 for a different reason. The test_strategy entry does say 'valid companion evidence' and 'the exported path diagnostic', but the criterion the orchestrator records is the looser one.",
+      "suggestion": "Tighten AC-1's statement to require that the cwd tree hold complete, decodable evidence and that the diagnostic name the undecodable artifact at the exported path, so a cwd-resolving regression fails on the message rather than accidentally passing on the exit code."
+    },
+    {
+      "severity": "low",
+      "issue": "AC-2 cannot fail if `emit()` is replaced by a plain `sys.stdout.write` on the CI/validation platform, since a UTF-8 locale encodes the non-cp1252 blackboard fine (this is the recorded PYTHONIOENCODING harness finding, deliberately out of scope). The explicit-encoding half of requirement #2 is therefore only guarded by the pre-existing source-level test inside AC-4's module run.",
+      "suggestion": "Either have the new AC-2 test force a cp1252 stdout codec in the subprocess env so the criterion stands alone, or state in AC-2 that the emit() guarantee is carried by the named source-level test in AC-4, so the reliance is explicit rather than implicit."
+    },
+    {
+      "severity": "low",
+      "issue": "AC-7, AC-8 and AC-9 cannot fail under this plan: the constraints forbid touching `.ai/scripts/*` and `.ai/schemas/*`, so these commands re-assert properties of unchanged files. They are correctly marked `material: false`, but they add no signal about the reconciliation.",
+      "suggestion": "Keep them if the intent is to mirror `.ai/validation.json` end to end, but say so in the statements (e.g. 'unchanged validation-profile regression guard') so a reader does not read them as evidence about this task's change."
+    }
+  ],
+  "blocking": []
+}

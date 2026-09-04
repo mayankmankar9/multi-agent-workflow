@@ -21,10 +21,13 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from _support import REPO_ROOT
 
@@ -66,9 +69,6 @@ class HookCase(unittest.TestCase):
     task_id = "TASK-999"
 
     def setUp(self):
-        import shutil
-        import tempfile
-
         self.tmp = Path(tempfile.mkdtemp(prefix="wf-hook-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
@@ -81,9 +81,22 @@ class HookCase(unittest.TestCase):
         PYTHONIOENCODING and PYTHONUTF8 are cleared deliberately: either one
         would make stdout UTF-8 regardless of the code under test and turn the
         encoding assertions below into tautologies.
+
+        The three rooting variables are *assigned*, never inherited. The hooks
+        prefer an exported absolute path over cwd, so inside an orchestrated
+        run the ambient values would point every fixture below at the live task
+        tree: the throwaway tree would be ignored and the cases would report on
+        evidence they did not write. Per-test overrides are applied last, so a
+        case that wants different rooting -- or a hostile ambient value -- can
+        still say so.
         """
         environment = dict(os.environ)
         environment["ORCHESTRATOR_TASK_ID"] = self.task_id
+        environment["ORCHESTRATOR_REPO_ROOT"] = str(self.tmp)
+        environment["ORCHESTRATOR_TASK_DIR"] = str(self.task_path)
+        environment["ORCHESTRATOR_CONSTITUTION"] = str(
+            self.tmp / ".ai" / "constitution.md"
+        )
         environment.pop("PYTHONIOENCODING", None)
         environment.pop("PYTHONUTF8", None)
         environment.update(env or {})
@@ -96,8 +109,22 @@ class HookCase(unittest.TestCase):
             env=environment,
         )
 
-    def write_notes(self, content="Did the thing.\n"):
-        path = self.task_path / "implementation.md"
+    def exported_tree(self):
+        """A second task tree, elsewhere on disk, to point a hook at.
+
+        Deliberately not under ``self.tmp``: cwd resolution cannot reach it, so
+        a case asserting on this tree's contents is asserting that the exported
+        path is what won.
+        """
+        root = Path(tempfile.mkdtemp(prefix="wf-exported-"))
+        self.addCleanup(shutil.rmtree, root, True)
+
+        path = root / ".ai" / "tasks" / self.task_id
+        path.mkdir(parents=True)
+        return path
+
+    def write_notes(self, content="Did the thing.\n", where=None):
+        path = (where or self.task_path) / "implementation.md"
 
         if isinstance(content, bytes):
             path.write_bytes(content)
@@ -106,7 +133,9 @@ class HookCase(unittest.TestCase):
 
         return path
 
-    def write_block(self, content="Learned a thing.", author="implementer"):
+    def write_block(
+        self, content="Learned a thing.", author="implementer", where=None
+    ):
         payload = {
             "block_id": "ctx-001",
             "type": "repo_finding",
@@ -114,12 +143,12 @@ class HookCase(unittest.TestCase):
             "phase": "IMPLEMENTING",
             "content": content,
         }
-        path = self.task_path / "context.jsonl"
+        path = (where or self.task_path) / "context.jsonl"
         path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
         return path
 
-    def write_raw_block(self, raw):
-        path = self.task_path / "context.jsonl"
+    def write_raw_block(self, raw, where=None):
+        path = (where or self.task_path) / "context.jsonl"
         path.write_bytes(raw)
         return path
 
@@ -261,6 +290,225 @@ class SessionStartDegradesLoudlyTests(HookCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b"")
+
+
+class HookRootingResilienceInteractionTests(HookCase):
+    """Where the evidence is, and whether the hook survives reading it.
+
+    Neither half carries these on its own. The cwd tree is given complete,
+    decodable evidence, so a hook that resolved against cwd would report a
+    clean pass and never see the fault the exported tree carries -- and the
+    fault is an undecodable byte, so a hook without its resilience helper dies
+    on it instead of ruling on it.
+    """
+
+    def test_stop_guard_fails_closed_on_undecodable_exported_task_artifact(self):
+        # Complete and decodable, so cwd resolution cannot block for the
+        # unrelated reason that it found nothing.
+        self.write_notes()
+        self.write_block()
+
+        exported = self.exported_tree()
+        self.write_block(where=exported)
+        broken = self.write_notes(INVALID_UTF8, where=exported)
+
+        result = self.run_hook(
+            "stop_guard.py", env={"ORCHESTRATOR_TASK_DIR": str(exported)}
+        )
+        stderr = result.stderr.decode("utf-8", errors="replace")
+
+        self.assertEqual(result.returncode, BLOCK, stderr[:400])
+        self.assertNotEqual(result.returncode, 1)
+        self.assertIn("not valid UTF-8", stderr)
+        self.assertIn(str(broken), stderr)
+        self.assertNotIn(str(self.task_path / "implementation.md"), stderr)
+
+    def test_session_start_injects_non_cp1252_exported_blackboard_under_cp1252_stdout(
+        self,
+    ):
+        self.write_block(content="Local cwd finding, not the exported one.")
+
+        exported = self.exported_tree()
+        self.write_block(
+            content="Chose %s for the label." % NON_CP1252, where=exported
+        )
+
+        result = self.run_hook(
+            "session_start.py",
+            env={
+                "ORCHESTRATOR_TASK_DIR": str(exported),
+                # Force the codec emit() must not consult. Under a UTF-8
+                # validation locale sys.stdout would encode this blackboard
+                # fine, and the criterion would prove nothing about emit().
+                "PYTHONIOENCODING": "cp1252",
+            },
+        )
+        stderr = result.stderr.decode("utf-8", errors="replace")
+
+        self.assertEqual(result.returncode, 0, stderr[:400])
+        self.assertIn(NON_CP1252.encode("utf-8"), result.stdout)
+        self.assertNotIn(b"Local cwd finding", result.stdout)
+
+
+class ExportedConstitutionResilienceTests(HookCase):
+    """The constitution is located by export and read like any other input."""
+
+    def constitution_outside_the_repo(self, content):
+        root = Path(tempfile.mkdtemp(prefix="wf-constitution-"))
+        self.addCleanup(shutil.rmtree, root, True)
+
+        path = root / "constitution.md"
+
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content, encoding="utf-8")
+
+        return path
+
+    def test_absent_constitution_is_silent(self):
+        """A checkout without one is not a fault, so nothing is said."""
+        self.write_block()
+
+        result = self.run_hook(
+            "session_start.py",
+            env={
+                "ORCHESTRATOR_CONSTITUTION": str(
+                    self.tmp / "nowhere" / "constitution.md"
+                )
+            },
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn(b"Project invariants", result.stdout)
+        self.assertNotIn(b"constitution", result.stderr)
+        self.assertIn(b"Learned a thing", result.stdout)
+
+    def test_undecodable_constitution_warns(self):
+        """One that exists and cannot be read is, so it degrades loudly."""
+        self.write_block()
+        constitution = self.constitution_outside_the_repo(INVALID_UTF8)
+
+        result = self.run_hook(
+            "session_start.py",
+            env={"ORCHESTRATOR_CONSTITUTION": str(constitution)},
+        )
+        stderr = result.stderr.decode("utf-8", errors="replace")
+
+        self.assertEqual(result.returncode, 0, stderr[:400])
+        self.assertIn("not valid UTF-8", stderr)
+        self.assertIn(str(constitution), stderr)
+        # The rest of the injection survives the gap.
+        self.assertIn(b"Learned a thing", result.stdout)
+
+    def test_readable_exported_constitution_uses_relative_label(self):
+        """The heading names the repo-relative path, not the exported one.
+
+        The exported path is absolute and, here, outside the repository
+        entirely. Labelling the section with it would leak a worker-irrelevant
+        absolute path into every injected context, which is why the label
+        stayed a constant when the lookup became an export.
+        """
+        constitution = self.constitution_outside_the_repo(
+            "Report only what you observed.\n"
+        )
+
+        result = self.run_hook(
+            "session_start.py",
+            env={"ORCHESTRATOR_CONSTITUTION": str(constitution)},
+        )
+        stdout = result.stdout.decode("utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr[:400])
+        self.assertIn("Report only what you observed.", stdout)
+        self.assertIn(
+            "Project invariants (%s)" % os.path.join(".ai", "constitution.md"),
+            stdout,
+        )
+        self.assertNotIn(str(constitution), stdout)
+
+
+class HookHarnessIsolationTests(unittest.TestCase):
+    """The harness must not hand the hooks the ambient orchestrator's tree.
+
+    ``run_hook`` inherited the three rooting variables. Inside an orchestrated
+    run those name real, complete evidence, and the hooks prefer an exported
+    path over cwd -- so every fixture in this module would have been answered
+    from the live task tree, passing while saying nothing about the code under
+    test. The decoy below stands in for that tree: complete notes, a valid
+    block, a readable constitution. Inheriting it inverts every assertion here.
+    """
+
+    def setUp(self):
+        self.decoy = Path(tempfile.mkdtemp(prefix="wf-decoy-"))
+        self.addCleanup(shutil.rmtree, self.decoy, True)
+
+        self.decoy_task = self.decoy / ".ai" / "tasks" / HookCase.task_id
+        self.decoy_task.mkdir(parents=True)
+
+        (self.decoy_task / "implementation.md").write_text(
+            "Decoy notes, complete enough to pass the guard.\n", encoding="utf-8"
+        )
+        (self.decoy_task / "context.jsonl").write_text(
+            json.dumps(
+                {
+                    "block_id": "ctx-001",
+                    "type": "repo_finding",
+                    "author": "implementer",
+                    "phase": "IMPLEMENTING",
+                    "content": "Decoy block.",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (self.decoy / ".ai" / "constitution.md").write_text(
+            "Decoy invariants.\n", encoding="utf-8"
+        )
+
+        self.hostile = {
+            "ORCHESTRATOR_TASK_DIR": str(self.decoy_task),
+            "ORCHESTRATOR_REPO_ROOT": str(self.decoy),
+            "ORCHESTRATOR_CONSTITUTION": str(
+                self.decoy / ".ai" / "constitution.md"
+            ),
+        }
+
+    def fixture(self):
+        """A ``HookCase`` driven directly rather than through the loader.
+
+        ``run_hook`` is named only because ``TestCase.__init__`` requires an
+        existing attribute; it does not match the test prefix, so nothing
+        collects it as a case.
+        """
+        case = HookCase("run_hook")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        return case
+
+    def test_run_hook_overrides_hostile_ambient_rooting_variables(self):
+        with mock.patch.dict(os.environ, self.hostile):
+            case = self.fixture()
+            # Its own tree: notes, and deliberately no block. The decoy has
+            # both, so reading the decoy would allow the session to end.
+            case.write_notes()
+
+            blocked = case.run_hook("stop_guard.py")
+
+            # With the task dir cleared, the other two variables decide where
+            # the blackboard and the constitution come from.
+            injected = case.run_hook(
+                "session_start.py", env={"ORCHESTRATOR_TASK_DIR": ""}
+            )
+
+        stderr = blocked.stderr.decode("utf-8", errors="replace")
+
+        self.assertEqual(blocked.returncode, BLOCK, stderr[:400])
+        self.assertIn(str(case.task_path / "context.jsonl"), stderr)
+        self.assertNotIn(str(self.decoy_task), stderr)
+
+        self.assertEqual(injected.returncode, 0, injected.stderr[:400])
+        self.assertEqual(injected.stdout, b"")
 
 
 class HookExitCodeContractTests(unittest.TestCase):

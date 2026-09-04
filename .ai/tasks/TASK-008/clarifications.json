@@ -1,0 +1,52 @@
+{
+  "task_id": "TASK-008",
+  "asked_at": "2026-09-03T09:22:33.693830+05:30",
+  "questions": [
+    {
+      "id": "Q-1",
+      "question": "Which state should `recover` leave an interrupted-IMPLEMENTING task in?",
+      "why": "It decides whether the partially-completed implementer work is kept and measured or thrown away. VALIDATING runs validation over the delta the killed worker already produced (and lets validation itself route the failure); FAILED + a recorded reason forces `route-failure`, so the next step is a classifier decision and probably a `fix` re-invocation; AWAITING_APPROVAL discards the attempt and re-runs `implement` against the same approved plan. Criterion 1 only says \"routable\", and criterion 3 forbids manufacturing completion, which all three satisfy.",
+      "options": [
+        "FAILED with failure_reason set to the interruption, routable via route-failure",
+        "VALIDATING, so the interrupted work is measured against the baseline",
+        "AWAITING_APPROVAL, discarding the attempt and re-running implement",
+        "recover records the interruption and the developer names the target state as an argument"
+      ],
+      "answer": "FAILED, with failure_reason set to the interruption, routable via route-failure so the classifier decides fix vs replan. Nothing on disk is discarded, and a fix re-invocation is what lets the implementer finish and write the implementation.md and blackboard block the killed worker never wrote. VALIDATING was rejected because it would measure and potentially bless work whose author never confirmed completion - there is not even a self-report to distrust. AWAITING_APPROVAL was rejected because it treats an unexplained interruption as if nothing happened. A developer-named target state was rejected because its only added power is a route into VALIDATING, the one outcome that risks blessing unconfirmed work. This also composes with F5: leaving FAILED must clear failure_reason."
+    },
+    {
+      "id": "Q-2",
+      "question": "How should a changed path be judged to belong to another open task, given decision 2 forbids reading other tasks' plan declarations?",
+      "why": "This is the whole mechanism behind the non-blocking `foreign` list and it determines what criterion 5 can assert. Using another open task's own baseline/delta means foreignness is computed from evidence the other task already owns; using the other task's recorded worktree prefix makes it a pure path rule that only works once F4 lands; a `.ai/tasks/<other-id>/` prefix rule covers only evidence files and would not demote task B's declared source files at all.",
+      "options": [
+        "A path is foreign if it lies under another open task's recorded worktree",
+        "A path is foreign if it appears in another open task's own delta against its baseline",
+        "A path is foreign only if it is under another open task's `.ai/tasks/<id>/` directory",
+        "Some combination \u2014 specify"
+      ],
+      "answer": "Combination, specified: a path is foreign if it lies under another open task's recorded worktree, OR if it lies under another task's .ai/tasks/<id>/ directory. Both are structural, deterministic path rules that read no other task's plan. Once F4 lands and a task's delta is computed inside its own worktree, the contamination largely disappears by construction, and the foreign list mainly serves the legacy no-worktree case. The 'appears in another open task's own delta' rule is explicitly REJECTED: every task's delta is itself whole-tree, so two open tasks would each mark the other's changes foreign - the rule is mutually recursive and could demote nearly everything, including real violations. Worktree-prefix-only was rejected because it does not demote another task's evidence files; task-dir-only was rejected because it does not demote another task's declared source files and so barely addresses F2."
+    },
+    {
+      "id": "Q-3",
+      "question": "When the worker runs rooted in the task's worktree, where should the blackboard and Stop-guard evidence that `session_start.py` and `stop_guard.py` resolve live \u2014 the main checkout's `.ai/tasks/<id>/`, or the worktree's copy?",
+      "why": "`run_worktree`'s docstring states the orchestrator stays in the main checkout \"because task artifacts live there\", so a worktree-rooted worker with cwd-relative hooks would read and write a different `.ai/tasks/<id>` from the one the orchestrator records events into. Pointing the hooks at the orchestrator's task directory (env var or absolute path) keeps one blackboard and one `implementation.md`; letting them follow cwd means evidence is split across two trees and `validate`/`review` must know which copy is authoritative. This also changes what criterion 7 and 8 assert.",
+      "options": [
+        "Hooks resolve the orchestrator's task directory explicitly; evidence stays single-homed in the main checkout",
+        "Evidence follows the worker into the worktree and the orchestrator reads it from there",
+        "Worker cwd is the worktree but the constitution/blackboard paths are passed as absolute paths in the prompt/env"
+      ],
+      "answer": "Hooks resolve the orchestrator's task directory explicitly rather than via cwd, so evidence is single-homed: one blackboard, one implementation.md, and validate/review never have to guess which copy is authoritative. This is the direct answer to the plan critic's blocking issue on plan v1. worker_env already exports ORCHESTRATOR_TASK_ID to the hooks, so passing the resolved task directory the same way is a small and natural extension; .ai/hooks/session_start.py and .ai/hooks/stop_guard.py must therefore be declared in files_to_modify. Letting evidence follow the worker was rejected because it splits evidence across two trees and makes the authoritative copy a question rather than a fact. Injecting absolute paths via the prompt is nearly equivalent and acceptable as an implementation detail, but the hooks - not the prompt text - should own the resolution, because prompt text can drift while a hook cannot."
+    },
+    {
+      "id": "Q-4",
+      "question": "For F3, should `committed_changed` be re-based onto a commit captured at baseline time, or dropped from the scope summary entirely?",
+      "why": "Re-basing keeps the corroboration signal but needs the task-start commit persisted somewhere \u2014 most naturally a new field in `baseline.json`, which then must tolerate existing manifests that lack it, and old baselines need a defined fallback (omit the section vs fall back to merge-base). Dropping the field removes `base`, `committed_changed` and `committed_not_in_delta` from validation evidence, which is simpler but is a visible change to the shape of existing evidence consumers.",
+      "options": [
+        "Record HEAD at baseline capture and diff against that; omit the section for baselines with no recorded commit",
+        "Drop committed_changed and its companions; the whole-tree delta is the measurement",
+        "Re-base, and fall back to the current merge-base behaviour for legacy baselines"
+      ],
+      "answer": "Record HEAD at baseline capture and diff against that; omit the section entirely for a baseline with no recorded commit. Correction to the question's premise: this needs no new field and no schema change, because baseline.json ALREADY records git.head, git.branch and git.merge_base - verified in .ai/tasks/TASK-007/baseline.json. So there is no migration and every baseline captured so far already carries what is needed. Omitting rather than falling back is deliberate and matches the repo rule that a check which could not run is recorded as did-not-run, never as a pass: the merge-base fallback would keep reporting the known-misleading branch-history answer. Dropping the field entirely was rejected because it discards a corroboration signal 811626d added on purpose and changes the shape of existing evidence."
+    }
+  ]
+}

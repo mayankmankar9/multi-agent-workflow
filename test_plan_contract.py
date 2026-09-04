@@ -8,6 +8,7 @@ planner be driven by ``codex exec --output-schema``.
 
 import json
 import unittest
+from unittest import mock
 
 from _support import (
     REPO_ROOT,
@@ -15,6 +16,7 @@ from _support import (
     VALID_PLAN,
     load_orchestrator,
     plan_json,
+    quiet,
 )
 
 orch = load_orchestrator()
@@ -345,6 +347,104 @@ class InterpreterPlaceholderContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn('verify.replace("{python}", interpreter())', source)
+
+
+class InitialPlanningFailureTests(TaskDirCase):
+    """A planning worker that exits non-zero is a handled outcome.
+
+    ``run_replan`` already recorded REPLAN_FAILED for exactly this failure
+    mode, while ``run_plan`` let the worker's CalledProcessError escape as a
+    raw traceback: the task stayed in PLANNING with ``plan_file: null`` and no
+    PLAN_FAILED event, so nothing in the trail recorded that planning had been
+    attempted at all. Observed on TASK-008's own planning run, which died in an
+    HTTP 400 from the planner.
+    """
+
+    def _planning(self):
+        self.write_requirement()
+        self.write_state(status="PLANNING", plan_file=None)
+
+    def _plan_with(self, side_effect):
+        with mock.patch.object(
+            orch.subprocess, "run", side_effect=side_effect
+        ):
+            with quiet() as out:
+                code = orch.run_plan(self.task_id)
+
+        return code, out.getvalue()
+
+    def test_nonzero_worker_records_plan_failed_and_actionable_state(self):
+        """The stubbed worker exits non-zero; assert the trail and the state."""
+        self._planning()
+
+        error = orch.subprocess.CalledProcessError(
+            1, ["codex"], stderr="HTTP 400 from the planner"
+        )
+        code, output = self._plan_with(error)
+
+        # Not a traceback: a return code, a reason and a next verb.
+        self.assertEqual(code, 1)
+        self.assertIn("planning failed", output)
+        self.assertIn("route-failure", output)
+
+        state = self.read_state()
+        self.assertEqual(state["status"], "FAILED")
+        self.assertIn("plan-worker", state["failure_reason"])
+
+        # FAILED is a state route-failure accepts, which is what "actionable"
+        # means here: PLANNING was accepted by nothing but `plan` itself. That
+        # the route really runs is asserted next door, on this same fixture.
+        failed = [e for e in self.events() if e["event"] == "PLAN_FAILED"]
+
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["worker"], "codex")
+        self.assertIn("plan-worker", failed[0]["failure_reason"])
+        self.assertEqual(failed[0]["plan_version"], 1)
+
+        # And the blackboard carries it forward to whoever runs next.
+        observations = [
+            block
+            for block in orch.read_context(self.task_id)
+            if block["type"] == "failure_observation"
+        ]
+        self.assertTrue(
+            any("Planning failed" in block["content"] for block in observations)
+        )
+
+    def test_the_failed_planning_task_can_be_routed(self):
+        """The claim is that the resulting state is actionable. Act on it."""
+        self._planning()
+        self._plan_with(orch.subprocess.CalledProcessError(1, ["codex"]))
+
+        with mock.patch.object(
+            orch,
+            "classify_failure_with_agent",
+            return_value=("DEVELOPER_CLARIFICATION", {"source": "test"}),
+        ):
+            with quiet():
+                self.assertEqual(orch.route_failure(self.task_id), 0)
+
+        self.assertTrue(
+            orch.has_event(self.task_id, "DEVELOPER_CLARIFICATION_REQUIRED")
+        )
+
+    def test_a_missing_worker_executable_is_also_handled(self):
+        """The other way the planner fails to run at all."""
+        self._planning()
+
+        code, output = self._plan_with(FileNotFoundError(2, "not found"))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.read_state()["status"], "FAILED")
+        self.assertIn("planning failed", output)
+        self.assertTrue(orch.has_event(self.task_id, "PLAN_FAILED"))
+
+    def test_no_plan_file_is_recorded_for_a_failed_run(self):
+        """A failed planning run must not leave a plan pointer behind."""
+        self._planning()
+        self._plan_with(orch.subprocess.CalledProcessError(1, ["codex"]))
+
+        self.assertIsNone(self.read_state().get("plan_file"))
 
 
 if __name__ == "__main__":

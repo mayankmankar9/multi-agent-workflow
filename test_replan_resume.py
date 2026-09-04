@@ -498,6 +498,212 @@ class CritiqueRoundTests(unittest.TestCase):
         self.assertFalse(ran)
 
 
+class PersistedCritiqueTests(TaskDirCase):
+    """A critique that is counted is not a critique that is recorded.
+
+    ``critique_round`` recorded ``issues=len(...)`` and ``blocking=len(...)``
+    and sent the text to stdout. So a developer at the approval gate was told
+    two blocking issues existed with no way to read them -- observed on
+    TASK-008's own plan v1, whose critique had to be recovered from a transient
+    524 KB log.
+
+    Driven through the ordinary planning and replanning control flow, not by
+    calling ``persist_critique`` directly: what is under test is that the
+    artifact exists by the time the developer is sent to read it.
+    """
+
+    HIGH = {
+        "severity": "high",
+        "issue": "AC-3 cannot fail: its verify command exits 0 regardless.",
+        "suggestion": "Assert the refusal, not the happy path.",
+    }
+    LOW = {
+        "severity": "low",
+        "issue": "The objective repeats the requirement's first line.",
+        "suggestion": "Say what changes, not what was asked.",
+    }
+
+    def _planning(self):
+        self.write_requirement()
+        self.write_state(status="PLANNING", plan_file=None)
+
+    def _run_planning(self, reply):
+        """Plan for real, with codex and the critic doubled."""
+
+        def fake_run(argv, **kwargs):
+            if worker_name(argv) == "claude":
+                return mock.Mock(
+                    returncode=0, stdout=json.dumps(reply), stderr=""
+                )
+
+            (self.task_path / "plan.json").write_text(
+                plan_json(), encoding="utf-8"
+            )
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(orch.subprocess, "run", side_effect=fake_run):
+            with quiet() as out:
+                code = orch.run_plan(self.task_id)
+
+        return code, out.getvalue()
+
+    def _read(self, path):
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_persisted_critique_contains_issue_text_and_severity(self):
+        """Readable off disk, without consulting process output."""
+        self._planning()
+
+        reply = {
+            "verdict": "pass",
+            "issues": [self.LOW],
+        }
+        code, _ = self._run_planning(reply)
+
+        self.assertEqual(code, 0)
+
+        path = orch.critique_file(
+            self.task_id, self.task_path / "plan.json", 1
+        )
+        self.assertTrue(path.is_file(), "no critique artifact at %s" % path)
+
+        recorded = self._read(path)
+
+        self.assertEqual(recorded["issues"], [self.LOW])
+        self.assertEqual(recorded["issues"][0]["severity"], "low")
+        self.assertIn("repeats the requirement", recorded["issues"][0]["issue"])
+        self.assertEqual(recorded["verdict"], "pass")
+        self.assertEqual(recorded["task_id"], self.task_id)
+        self.assertTrue(recorded["ran"])
+
+        # And the trail names the file, so the artifact is discoverable from
+        # the evidence rather than only by construction.
+        events = [
+            e
+            for e in self.events()
+            if e["event"] == "PLAN_CRITIQUE_RECORDED"
+        ]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(orch.Path(events[-1]["critique_file"]), path)
+
+    def test_rounds_exhausted_persists_current_blocking_critique_identity(
+        self,
+    ):
+        """The artifact the developer is told to read before approving."""
+        self._planning()
+
+        reply = {
+            "verdict": "revise",
+            "issues": [self.HIGH, self.LOW],
+            "blocking": [self.HIGH],
+        }
+        code, output = self._run_planning(reply)
+
+        self.assertEqual(code, 0)
+        self.assertIn("still objects", output)
+        self.assertEqual(self.read_state()["status"], "AWAITING_APPROVAL")
+
+        plan_file = self.task_path / "plan.json"
+        final = orch.critique_file(
+            self.task_id, plan_file, orch.CRITIC_MAX_ROUNDS
+        )
+        self.assertTrue(final.is_file(), "no final critique at %s" % final)
+
+        recorded = self._read(final)
+
+        # It is the current one, and it says so: round and plan version, not
+        # just "a critique happened".
+        self.assertTrue(recorded["rounds_exhausted"])
+        self.assertFalse(recorded["acceptable"])
+        self.assertEqual(recorded["round"], orch.CRITIC_MAX_ROUNDS)
+        self.assertEqual(recorded["max_rounds"], orch.CRITIC_MAX_ROUNDS)
+        self.assertEqual(recorded["plan_version"], 1)
+        self.assertEqual(recorded["plan_stem"], "plan")
+        self.assertEqual(recorded["verdict"], "revise")
+
+        # The blocking issue text and both severities survived.
+        self.assertEqual(recorded["blocking"], [self.HIGH])
+        self.assertEqual(recorded["blocking_count"], 1)
+        self.assertEqual(
+            [issue["severity"] for issue in recorded["issues"]],
+            ["high", "low"],
+        )
+        self.assertIn("cannot fail", recorded["blocking"][0]["issue"])
+        self.assertEqual(
+            recorded["blocking"][0]["suggestion"], self.HIGH["suggestion"]
+        )
+
+        # Every earlier round is on disk too, and none of them claims to be
+        # the exhausted one.
+        earlier = self._read(orch.critique_file(self.task_id, plan_file, 1))
+
+        self.assertEqual(earlier["round"], 1)
+        self.assertFalse(earlier["rounds_exhausted"])
+
+    def test_artifact_name_distinguishes_plan_version_and_round(self):
+        """A stale round must not be able to pass for the current one."""
+        self._planning()
+
+        reply = {
+            "verdict": "revise",
+            "issues": [self.HIGH],
+            "blocking": [self.HIGH],
+        }
+        self._run_planning(reply)
+
+        # A replan writes plan-v2.json, so its critique lands beside the
+        # first plan's rather than on top of it.
+        plan_v2 = self.task_path / "plan-v2.json"
+        plan_v2.write_text(plan_json(), encoding="utf-8")
+        _, state = orch.load_state(self.task_id)
+        state["plan_version"] = 2
+
+        with mock.patch.object(
+            orch, "critique_plan", return_value=(False, {
+                "ran": True,
+                "verdict": "revise",
+                "issues": [self.HIGH],
+                "blocking": [self.HIGH],
+            })
+        ):
+            with quiet():
+                orch.critique_round(self.task_id, plan_v2, state, 1)
+
+        names = sorted(
+            path.name for path in self.task_path.glob("critique-*.json")
+        )
+
+        self.assertEqual(
+            names,
+            [
+                "critique-plan-round-1.json",
+                "critique-plan-round-2.json",
+                "critique-plan-v2-round-1.json",
+            ],
+        )
+
+        # The path is derivable from task id, plan stem and round -- which is
+        # what lets a developer find the current artifact without reading the
+        # implementation.
+        derived = orch.critique_file(self.task_id, plan_v2, 1)
+
+        self.assertEqual(derived.name, "critique-plan-v2-round-1.json")
+        # Task-relative, like every other piece of evidence: the orchestrator
+        # runs from the checkout, so this resolves into the task directory.
+        self.assertEqual(derived.resolve().parent, self.task_path.resolve())
+
+        # And the payload identifies itself, so a file copied out of the
+        # directory is still attributable.
+        current = self._read(derived)
+        stale = self._read(
+            orch.critique_file(self.task_id, self.task_path / "plan.json", 1)
+        )
+
+        self.assertEqual((current["plan_version"], current["round"]), (2, 1))
+        self.assertEqual((stale["plan_version"], stale["round"]), (1, 1))
+        self.assertNotEqual(current["plan_stem"], stale["plan_stem"])
+
+
 class ReplanDispatchTests(unittest.TestCase):
     def test_replan_is_a_dispatchable_verb(self):
         self.assertIn("replan", orch.ACTIONS)
